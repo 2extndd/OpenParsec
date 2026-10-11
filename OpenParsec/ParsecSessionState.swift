@@ -198,6 +198,11 @@ final class ParsecSessionTracker: @unchecked Sendable {
             if status == previous.transportStatus, status.isFailure, previous.phase == .failed {
                 return nil
             }
+            // After a disconnect the SDK only says "not running": keep the real
+            // cause (e.g. -6013 from the failed reconnect) as lastFailure.
+            if status.rawValue == -3, previous.phase == .disconnected {
+                return nil
+            }
             let nextSequence = previous.sequence &+ 1
             if status.isFailure {
                 let failure = ParsecSessionFailure(

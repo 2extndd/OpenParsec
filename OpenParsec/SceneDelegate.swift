@@ -42,6 +42,9 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate
 	func sceneDidEnterBackground(_ scene: UIScene)
 	{
 		guard ParsecBackgroundManager.shared.hasActiveConnection else { return }
+		// Really backgrounded (not just inactive): stop the video stream before
+		// iPadOS invalidates VideoToolbox (ParsecSDKBridge.setVideoSuspended).
+		CParsec.setVideoSuspended(true, stopStream: true)
 
 		var pipAttempted = false
 		if #available(iOS 15.0, *), !OpenParsecRuntime.disablesPiP {

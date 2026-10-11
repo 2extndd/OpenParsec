@@ -844,12 +844,16 @@ enum ParsecVideoSuspendPolicy {
         elapsed: TimeInterval,
         decoded: Bool,
         status: RemoteStatus,
-        nudged: Bool
+        nudged: Bool,
+        rttMs: Float = 0
     ) -> Recovery {
         if ParsecDecodeErrorPolicy.isDecodeError(status) { return .failed }
         if decoded { return .recovered }
-        if elapsed >= stallAfter { return .stalled }
-        if elapsed >= nudgeAfter && !nudged { return .nudge }
+        // A keyframe over a slow VPN routinely needs > 1 s: scale with RTT so
+        // a slow link waits instead of nudging/reconnecting (capped).
+        let rtt = rttMs.isFinite ? TimeInterval(max(0, rttMs)) / 1000 : 0
+        if elapsed >= min(max(stallAfter, 10 * rtt), 8) { return .stalled }
+        if elapsed >= min(max(nudgeAfter, 4 * rtt), 3) && !nudged { return .nudge }
         return .waiting
     }
 
@@ -873,8 +877,8 @@ enum ParsecVideoSuspendPolicy {
     ///
     /// Field evidence (iPad Pro M4, LAN, macOS host, 3024x1964 H.265): SIGSEGV at
     /// this exact site at 40 Mbps (Jul) and 50 Mbps, no crash at 20 Mbps — so 20
-    /// is the only empirically safe ceiling. `0` ("Host Default") is passed
-    /// through untouched: it sends no explicit request and has no crash data.
+    /// is the only empirically safe ceiling. `0` ("Host Default") adopts the
+    /// host's own value from its first echo, so it is capped to 20 as well.
     /// ponytail: conservative cap; values between 20 and 40 are simply untested.
     static let maxSafeHostBitrate = 20
 

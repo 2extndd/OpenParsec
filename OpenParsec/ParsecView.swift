@@ -10,6 +10,8 @@ struct ParsecStatusBar : View {
 	@Binding var DCAlertText: String
 	@State var parsecViewController: ParsecViewController?
 	@State var wasDisconnected: Bool = true
+	// In-session reconnect retries (decode error, transport loss): show it.
+	@State private var isReconnecting = false
 	// Pure policy owns the failure streak and one-reconnect budget; the
 	// background manager remains the only scheduler/effect owner.
 	@State private var transportRecovery = ParsecTransportRecoveryMonitor(
@@ -91,9 +93,9 @@ struct ParsecStatusBar : View {
 				poll()
 			}
 
-		// Reconnecting overlay — only visible during changeResolution's
-		// disconnect→reconnect dance. Mirrors MainView's connecting overlay.
-		if isReconfiguring {
+		// Reconnecting overlay — changeResolution's disconnect→reconnect dance,
+		// or the connect runner retrying in-session. Mirrors MainView's overlay.
+		if isReconfiguring || isReconnecting {
 			ZStack {
 				Rectangle()
 					.fill(Color.black.opacity(0.45))
@@ -102,7 +104,7 @@ struct ParsecStatusBar : View {
 					ProgressView()
 						.scaleEffect(1.4)
 						.progressViewStyle(CircularProgressViewStyle(tint: .white))
-					Text("Switching resolution…")
+					Text(isReconfiguring ? "Switching resolution…" : "Reconnecting…")
 						.foregroundColor(.white)
 						.font(.system(size: 16, weight: .medium))
 				}
@@ -142,7 +144,9 @@ struct ParsecStatusBar : View {
 		}
 		// Between connect retries the SDK is intentionally disconnected (-3);
 		// the runner owns the outcome and reports it itself.
-		if ParsecConnectRunner.shared.isRunning { return }
+		let running = ParsecConnectRunner.shared.isRunning
+		if isReconnecting != running { isReconnecting = running }
+		if running { return }
 		
 		let generation = CParsec.sessionSnapshot.generation
 		let clientStatus = CParsec.getStatusEx(generation: generation)
@@ -413,7 +417,9 @@ struct ParsecView: View
 							}
 							Menu() {
 								ForEach(resolutions, id: \.self) { resolution in
-									let isCurrent = resolution.width == dataModel.resolutionX && resolution.height == dataModel.resolutionY
+									// The selection, not the stream size: a Mac host always
+									// echoes its native size, which matches no menu entry.
+									let isCurrent = resolution == SettingsHandler.resolution
 									Button(action: {
 										changeResolution(res: resolution)
 									}) {
@@ -460,7 +466,8 @@ struct ParsecView: View
 									.frame(maxWidth:.infinity)
 									.multilineTextAlignment(.center)
 							}
-							if let target = ParsecDisplayConfig.toggleTarget(in: dataModel.displayConfigs, current: dataModel.output) {
+							// Auto ("none"): the host's echoed output is what is streaming.
+							if let target = ParsecDisplayConfig.toggleTarget(in: dataModel.displayConfigs, current: dataModel.output == "none" ? dataModel.hostOutput : dataModel.output) {
 								// Two monitors: one tap flips to the other one.
 								Button(action: { changeDisplay(displayId: target.id) }) {
 									Text("Switch to \(target.menuLabel(in: dataModel.displayConfigs))")
@@ -741,13 +748,6 @@ struct ParsecView: View
 		// case-11 echo keeps it and pushes it instead of adopting host default.
 		DataManager.model.constantFps = constantFps
 
-		let screenSize: CGSize = self.parsecViewController.view.frame.size
-		let scaleFactor = UIScreen.main.nativeScale
-		ParsecResolution.updateClientResolution(
-			width: Int(screenSize.width * scaleFactor),
-			height: Int(screenSize.height * scaleFactor)
-		)
-
 		getHostUserData()
 
 		hideOverlay = SettingsHandler.noOverlay
@@ -842,6 +842,9 @@ struct ParsecView: View
 			DataManager.model.resolutionX = res.width
 			DataManager.model.resolutionY = res.height
 		}
+		// A macOS host always streams its native size (vp_supported=0):
+		// reconnecting would only black out the picture for nothing.
+		if CParsec.hostOS == .macos { return }
 
 		// Parsec's host honours bitrate / FPS / output via setVideoConfig
 		// user-data, but NOT resolution — that field is only read at

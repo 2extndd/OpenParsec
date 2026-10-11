@@ -727,15 +727,15 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		// Otherwise GLK autoresizing can publish portrait/ultrawide dimensions
 		// to the SDK while the app is leaving the foreground.
 		glkView?.cleanUp()
-		// Stop video before iPadOS can invalidate VideoToolbox: one decode on a
-		// dead session kills the SDK decode thread (ParsecVideoSuspendPolicy).
+		// Pause host video; the stream itself is stopped only if the app really
+		// goes to the background (SceneDelegate.sceneDidEnterBackground).
 		CParsec.setVideoSuspended(true)
 		// keyboardWillHide fires while backgrounding; remember the user's choice.
 		keyboardWasVisibleBeforeResign = keyboardVisible
 	}
 
 	@objc private func appDidBecomeActive() {
-		// Fresh decoder + keyframe, no reconnect (ParsecVideoSuspendPolicy).
+		// Unpause (+ fresh decoder and keyframe after a real background), no reconnect.
 		CParsec.setVideoSuspended(false)
 		// App-switch gestures can leave UIScrollView's pinch/offset in an
 		// intermediate zoom. At zoom > 1, scroll is intentionally consumed
@@ -1304,6 +1304,15 @@ extension ParsecViewController : UIGestureRecognizerDelegate {
 		return true
 	}
 
+	// The tap waits for the long-press to fail; outside touchpad mode the
+	// long-press does nothing, so it must not begin (a slow tap would click nothing).
+	func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+		if gestureRecognizer is UILongPressGestureRecognizer {
+			return SettingsHandler.cursorMode == .touchpad
+		}
+		return true
+	}
+
 	@objc func handlePinchGesture(_ gestureRecognizer: UIPinchGestureRecognizer) {
 		// Pinch is handled by UIScrollView
 	}
@@ -1756,7 +1765,8 @@ extension ParsecViewController : UIKeyInput, UITextInputTraits {
 	}
 
 	func insertText(_ text: String) {
-		CParsec.sendVirtualKeyboardInput(text: text)
+		// Per character: typed/pasted "F5" or "TAB" must not become that key.
+		text.forEach { CParsec.sendVirtualKeyboardInput(text: String($0)) }
 	}
 
 	func deleteBackward() {
@@ -2110,7 +2120,10 @@ extension ParsecViewController {
 		case "\r", "\n": keyText = "ENTER"
 		default: keyText = raw.uppercased()
 		}
-		guard let key = KeyCodeTranslators.parsecKeyCodeTranslator(keyText) else { return }
+		// Punctuation (⌘- ⌘= ⌘[ ⌘/ ⌘` …) has no key name: use the character table.
+		let charCode = KeyCodeTranslators.getRemoteKeyCode(for: raw).remoteKeyCode
+		guard let key = KeyCodeTranslators.parsecKeyCodeTranslator(keyText)
+			?? (charCode > 0 ? RemoteKeyCode(rawValue: UInt32(charCode)) : nil) else { return }
 
 		var chord: [RemoteKeyCode] = []
 		if mods.contains(.command),

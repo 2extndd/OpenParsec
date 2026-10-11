@@ -40,6 +40,7 @@ class ParsecSDKBridge: ParsecService
 	// See ParsecVideoSuspendPolicy. Guarded by CParsec.lifecycleLock.
 	private var videoSuspended = false
 	private var decoderFlipped = false
+	private var streamStopped = false
 	private var videoResume: (at: CFAbsoluteTime, decodeLatency: Float, nudged: Bool)?
 	// Pollers and the input gate share one condition. A reconnect must drain
 	// both SDK poll calls before ParsecClientDisconnect and cannot start a new
@@ -227,16 +228,20 @@ class ParsecSDKBridge: ParsecService
 		// DataManager.model outlives sessions. Another host's display id/list
 		// must not ride the first-echo push (host would capture a missing
 		// output → black screen, then retry for ~5 s waiting on a confirm).
-		if peerID != lastSessionPeerID {
+		// Also when session choices aren't remembered: a reconnect must not
+		// re-push the previous display switch.
+		if peerID != lastSessionPeerID || !SettingsHandler.saveSessionSettings {
 			lastSessionPeerID = peerID
 			DispatchQueue.main.async {
 				DataManager.model.output = "none"
+				DataManager.model.hostOutput = "none"
 				DataManager.model.displayConfigs = []
 			}
 		}
 
 		// A new decode_thread starts with a fresh decoder and an unpaused host.
 		videoSuspended = false
+		streamStopped = false
 		decoderFlipped = false
 		videoResume = nil
 
@@ -317,7 +322,7 @@ class ParsecSDKBridge: ParsecService
 		self.hostWidth = Float(decoder.width)
 
 		return RemoteClientStatus(
-			status: checkVideoResume(RemoteStatus(result), decodeLatency: metrics.decodeLatency),
+			status: checkVideoResume(RemoteStatus(result), decodeLatency: metrics.decodeLatency, rttMs: metrics.networkLatency),
 			metrics: RemoteClientMetrics(
 				decodeLatency: Double(metrics.decodeLatency),
 				encodeLatency: Double(metrics.encodeLatency),
@@ -446,6 +451,7 @@ class ParsecSDKBridge: ParsecService
 
 				DispatchQueue.main.async {
 					self.hostOutput = videoConfig.output
+					DataManager.model.hostOutput = videoConfig.output
 					Diagnostics.note(
 						"video-config event=echo output=\(videoConfig.output) bitrate=\(videoConfig.encoderMaxBitrate) " +
 						"fullFPS=\(videoConfig.fullFPS) res=\(videoConfig.resolutionX)x\(videoConfig.resolutionY) " +
@@ -550,7 +556,9 @@ class ParsecSDKBridge: ParsecService
 							Diagnostics.note("display-output event=restore result=matched rolled=\(match.id != savedId)")
 							DataManager.model.output = match.id
 							SettingsHandler.savedDisplayOutput = match.id // re-sync if id rolled
-							self.updateHostVideoConfig()
+							// Already streaming it (first-echo push carried it): no
+							// second push → no second encoder restart at start.
+							if match.id != self.hostOutput { self.updateHostVideoConfig() }
 						} else {
 							Diagnostics.note("display-output event=restore result=no-match")
 						}
@@ -591,6 +599,8 @@ class ParsecSDKBridge: ParsecService
 		let size = event.cursor.size
 		let width = event.cursor.width
 		let height = event.cursor.height
+		// Host-supplied sizes: never read past the buffer the SDK gave us.
+		guard Int(size) >= Int(width) * Int(height) * 4 else { return }
 
 		// Build the CGImage BEFORE taking the lock — image construction is the
 		// expensive part and must not run while the snapshot getter is blocked.
@@ -672,46 +682,62 @@ class ParsecSDKBridge: ParsecService
 		ParsecClientSetConfig(_parsec, &parsecClientCfg);
 	}
 
-	func setVideoSuspended(_ suspended: Bool) {
-		let event = suspended ? "suspend" : "resume"
-		guard backgroundTaskRunning, suspended != videoSuspended else {
-			Diagnostics.note("video-pause event=\(event) result=skipped connected=\(backgroundTaskRunning) suspended=\(videoSuspended)")
+	/// `stopStream: false` (resign-active: Control Center, notification shade,
+	/// app-switcher peek, system alerts): only pause the host. VideoToolbox
+	/// stays valid, the renderer keeps the last frame, and unpausing makes the
+	/// host send a keyframe — nothing to recover.
+	/// `stopStream: true` (really backgrounded): also disable the stream so
+	/// nothing reaches a decoder iPadOS invalidates. EnableStream(false) also
+	/// destroys the SDK's GL renderer (same body as ParsecClientGLDestroy,
+	/// 0x7a884), so this is reserved for the background.
+	func setVideoSuspended(_ suspended: Bool, stopStream: Bool) {
+		let event = suspended ? (stopStream ? "stop" : "suspend") : "resume"
+		guard backgroundTaskRunning else {
+			Diagnostics.note("video-pause event=\(event) result=skipped connected=false")
 			return
 		}
-		videoSuspended = suspended
 		if suspended {
-			// Stop the video stream itself while away. Device log 12:51:26: with
-			// only Pause + a decoder reset, the macOS host kept streaming, the
-			// reset's keyframe rebuilt the decoder and the next frame was decoded
-			// in the background → vt_callback -14 → decode thread dead. A
-			// disabled stream delivers nothing, so nothing is decoded and no
-			// keyframe is requested until we come back.
-			let pause = RemoteStatus(ParsecClientPause(_parsec, true, false))
-			let disable = RemoteStatus(ParsecClientEnableStream(_parsec, UInt8(DEFAULT_STREAM), false))
-			videoResume = nil
-			Diagnostics.note("video-pause event=\(event) result=\(pause.rawValue) stream=\(disable.rawValue)")
+			if !videoSuspended {
+				videoSuspended = true
+				videoResume = nil
+				let pause = RemoteStatus(ParsecClientPause(_parsec, true, false))
+				Diagnostics.note("video-pause event=suspend result=\(pause.rawValue)")
+			}
+			if stopStream && !streamStopped {
+				// Device log 12:51:26: Pause alone did not stop the macOS host;
+				// a frame decoded in the background → vt_callback -14 → dead
+				// decode thread. A disabled stream delivers nothing.
+				streamStopped = true
+				let disable = RemoteStatus(ParsecClientEnableStream(_parsec, UInt8(DEFAULT_STREAM), false))
+				Diagnostics.note("video-pause event=stop stream=\(disable.rawValue)")
+			}
 			return
 		}
-		// Force a fresh decoder before any resumed frame: the VT session from
-		// before the app switch may be invalid. The config change makes
-		// decode_thread drop it on its next pass and wait for a keyframe,
-		// which the re-enabled stream starts with.
-		decoderFlipped.toggle()
-		applyConfig()
-		let enable = RemoteStatus(ParsecClientEnableStream(_parsec, UInt8(DEFAULT_STREAM), true))
-		Diagnostics.note("video-stream event=enable result=\(enable.rawValue)")
-		var status = ParsecClientStatus()
-		ParsecClientGetStatus(_parsec, &status)
-		videoResume = (CFAbsoluteTimeGetCurrent(), status.`self`.metrics.0.decodeLatency, false)
+		guard videoSuspended else { return }
+		videoSuspended = false
+		if streamStopped {
+			streamStopped = false
+			// Force a fresh decoder before any resumed frame: the VT session
+			// from before the background may be invalid. The config change
+			// makes decode_thread drop it and wait for a keyframe, which the
+			// re-enabled stream starts with.
+			decoderFlipped.toggle()
+			applyConfig()
+			let enable = RemoteStatus(ParsecClientEnableStream(_parsec, UInt8(DEFAULT_STREAM), true))
+			Diagnostics.note("video-stream event=enable result=\(enable.rawValue)")
+			var status = ParsecClientStatus()
+			ParsecClientGetStatus(_parsec, &status)
+			videoResume = (CFAbsoluteTimeGetCurrent(), status.`self`.metrics.0.decodeLatency, false)
+			Diagnostics.note("decoder-recovery event=awaiting-keyframe")
+		}
 		let result = RemoteStatus(ParsecClientPause(_parsec, false, false))
-		Diagnostics.note("video-pause event=\(event) result=\(result.rawValue)")
-		Diagnostics.note("decoder-recovery event=awaiting-keyframe")
+		Diagnostics.note("video-pause event=resume result=\(result.rawValue)")
 	}
 
 	/// Resume follow-up, driven by the session poll. Returns the status the
 	/// transport monitor should see: a stalled resume is reported as -14 so the
 	/// existing decode-error reconnect stays the last resort.
-	private func checkVideoResume(_ status: RemoteStatus, decodeLatency: Float) -> RemoteStatus {
+	private func checkVideoResume(_ status: RemoteStatus, decodeLatency: Float, rttMs: Float) -> RemoteStatus {
 		guard let resume = videoResume else { return status }
 		let elapsed = CFAbsoluteTimeGetCurrent() - resume.at
 		let ms = Int(elapsed * 1000)
@@ -719,7 +745,8 @@ class ParsecSDKBridge: ParsecService
 			elapsed: elapsed,
 			decoded: decodeLatency != resume.decodeLatency,
 			status: status,
-			nudged: resume.nudged
+			nudged: resume.nudged,
+			rttMs: rttMs
 		) {
 		case .waiting:
 			return status
@@ -733,9 +760,14 @@ class ParsecSDKBridge: ParsecService
 			return status
 		case .nudge:
 			videoResume?.nudged = true
-			Diagnostics.note("decoder-recovery event=nudge ms=\(ms) action=video-config-push")
-			// Host restarts capture/encoder on this push → fresh keyframe.
-			DispatchQueue.main.async { self.updateHostVideoConfig() }
+			Diagnostics.note("decoder-recovery event=nudge ms=\(ms) rttMs=\(Int(rttMs)) action=decoder-reset")
+			// Decoder reset → keyframe request (0x7f230). Cheaper than a host
+			// video-config push, which restarts the encoder and throws away a
+			// keyframe that may still be in flight on a slow link.
+			DispatchQueue.main.async {
+				self.decoderFlipped.toggle()
+				self.applyConfig()
+			}
 			return status
 		case .stalled:
 			videoResume = nil
@@ -1106,13 +1138,19 @@ class ParsecSDKBridge: ParsecService
 		// if this call is still the latest (a newer tap supersedes it).
 		// Then ask the host to echo back its current config so case-11
 		// confirms the switch landed.
-		DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) { [weak self] in
-			guard let self = self, self.backgroundTaskRunning, self.configRevision == revision else { return }
-			CParsec.sendUserData(type: .setVideoConfig, message: data)
-		}
+		// Every push restarts the host encoder (stutter + keyframe), so resend
+		// only if the host's echo has not confirmed it after 1 s. Display
+		// switches have their own confirm/retry loop below.
+		let empty = Data()
 		DispatchQueue.global().asyncAfter(deadline: .now() + 0.45) { [weak self] in
 			guard let self = self, self.backgroundTaskRunning, self.configRevision == revision else { return }
-			let empty = "".data(using: .utf8)!
+			CParsec.sendUserData(type: .getVideoConfig, message: empty)
+		}
+		DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+			guard let self = self, self.backgroundTaskRunning, self.configRevision == revision,
+				  self.pendingUserConfig != nil else { return }
+			Diagnostics.note("video-config event=resend revision=\(revision) reason=unconfirmed")
+			CParsec.sendUserData(type: .setVideoConfig, message: data)
 			CParsec.sendUserData(type: .getVideoConfig, message: empty)
 		}
 		// Self-heal: drop the pending guard after a confirmation window so a

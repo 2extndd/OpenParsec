@@ -189,6 +189,8 @@ class SharedModel: ObservableObject {
 	@Published var bitrate = 0
 	@Published var constantFps = false
 	@Published var output = "none"
+	// Output the host reports it is streaming (case-11 echo); "none" until known.
+	@Published var hostOutput = "none"
 	@Published var displayConfigs: [ParsecDisplayConfig] = []
 	// Host OS as reported in the case-11 video config. -1 = unknown / not yet
 	// received. The Int→OS encoding is empirical (see HostOS.from); this raw

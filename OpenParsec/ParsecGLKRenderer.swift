@@ -75,9 +75,10 @@ class ParsecGLKRenderer:NSObject, GLKViewDelegate, GLKViewControllerDelegate
 		// viewport=0,0,2421,1668 for a 3024x1964 stream) until some unrelated
 		// resize happened.
 		let sessionGeneration = CParsec.sessionSnapshot.generation
-		if widthChanged || heightChanged || syncedGeneration != sessionGeneration {
+		if widthChanged || heightChanged || syncedGeneration != sessionGeneration,
+		   synchronizeDimensions() {
+			// Recorded only once it reached the SDK (skipped while inactive).
 			syncedGeneration = sessionGeneration
-			synchronizeDimensions()
 		}
 
 		// Never wait for a frame here: this runs on the main thread every display
@@ -88,11 +89,11 @@ class ParsecGLKRenderer:NSObject, GLKViewDelegate, GLKViewControllerDelegate
 		RenderClock.lastDrawAt = CACurrentMediaTime()
 		let result = CParsec.renderGLFrame(timeout: 0)
 		let generation = CParsec.sessionSnapshot.generation
-		if result.producedFrame && lastLoggedRenderGeneration != generation {
+		if result.producedFrame && lastLoggedRenderGeneration != generation,
+		   // SetDimensions while the session was still connecting may not
+		   // stick; the session is certainly running once it produced a frame.
+		   synchronizeDimensions() {
 			lastLoggedRenderGeneration = generation
-			// SetDimensions while the session was still connecting may not
-			// stick; the session is certainly running once it produced a frame.
-			synchronizeDimensions()
 			Diagnostics.note(
 				"render-geometry event=first-produced generation=\(generation) " +
 				geometryDescription()
@@ -117,12 +118,14 @@ class ParsecGLKRenderer:NSObject, GLKViewDelegate, GLKViewControllerDelegate
 		//glFlush()
 	}
 
-	func synchronizeDimensions() {
-		guard UIApplication.shared.applicationState == .active else { return }
+	@discardableResult
+	func synchronizeDimensions() -> Bool {
+		guard UIApplication.shared.applicationState == .active else { return false }
 		let size = glkView.bounds.size
-		guard size.width > 0, size.height > 0 else { return }
+		guard size.width > 0, size.height > 0 else { return false }
 		CParsec.setFrame(size.width, size.height, glkView.contentScaleFactor)
 		lastSize = size
+		return true
 		// No log here: this runs per frame during a resize animation. The
 		// settled result is logged once by ParsecViewController.
 	}

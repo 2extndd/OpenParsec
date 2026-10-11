@@ -1886,6 +1886,14 @@ final class ParsecClientTypesTests: XCTestCase {
         // The stall is reported as a decode error, so the existing monitor
         // performs the one last-resort reconnect.
         XCTAssertTrue(ParsecDecodeErrorPolicy.isDecodeError(RemoteStatus(rawValue: -14)))
+        // Slow link (VPN, RTT 400 ms): wait for the keyframe instead of
+        // nudging at 1 s / reconnecting at 3 s; both thresholds are capped.
+        XCTAssertEqual(P.recovery(elapsed: 1.2, decoded: false, status: ok, nudged: false, rttMs: 400), .waiting)
+        XCTAssertEqual(P.recovery(elapsed: 1.6, decoded: false, status: ok, nudged: false, rttMs: 400), .nudge)
+        XCTAssertEqual(P.recovery(elapsed: 3.5, decoded: false, status: ok, nudged: true, rttMs: 400), .waiting)
+        XCTAssertEqual(P.recovery(elapsed: 4.0, decoded: false, status: ok, nudged: true, rttMs: 400), .stalled)
+        XCTAssertEqual(P.recovery(elapsed: 8.0, decoded: false, status: ok, nudged: true, rttMs: 5000), .stalled)
+        XCTAssertEqual(P.recovery(elapsed: 1.0, decoded: false, status: ok, nudged: false, rttMs: .nan), .nudge)
     }
 
     func testDecodeErrorOnUnfinishedReplacementIsTerminal() {

@@ -145,15 +145,32 @@ enum Diagnostics {
 		return docs.appendingPathComponent("diagnostics.log")
 	}
 
-	// Called from SDK log/poll threads too; serialize seek+write so lines never interleave.
-	private static let lock = NSLock()
-	// Created once (~60 µs each); only used under `lock`.
+	// Called from input, SDK log and poll threads: callers only enqueue (no file
+	// I/O on the click/chord hot paths); one serial queue writes, in order.
+	private static let queue = DispatchQueue(label: "openparsec.diagnostics", qos: .utility)
+	// Created once (~60 µs each); only used on `queue`.
 	private static let formatter = ISO8601DateFormatter()
+	// Collapse bursts of identical SDK lines (72× nat_read_packet in 2 s).
+	private static var lastSDKLine: String?
+	private static var repeats = 0
 
 	static func note(_ line: String) {
-		lock.lock()
-		defer { lock.unlock() }
-		let stamp = formatter.string(from: Date())
+		let now = Date()
+		queue.async { write(line, at: now) }
+	}
+
+	private static func write(_ line: String, at date: Date) {
+		if line.hasPrefix("sdk-log "), line == lastSDKLine {
+			repeats += 1
+			return
+		}
+		if repeats > 0 {
+			let n = repeats
+			repeats = 0
+			write("sdk-log (previous line repeated \(n)×)", at: date)
+		}
+		lastSDKLine = line.hasPrefix("sdk-log ") ? line : nil
+		let stamp = formatter.string(from: date)
 		let entry = "[\(stamp)] \(line)\n"
 		print("[OpenParsec][diag] \(line)")
 		guard let data = entry.data(using: .utf8) else { return }

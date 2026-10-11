@@ -107,7 +107,7 @@ struct SettingsView:View
 								// high-res H.265 keyframes (see ParsecVideoSuspendPolicy), so
 								// they are not offered; the send path clamps as a backstop.
 								MultiPicker(selection: $bitrate, options:
-								[Choice("Host Default", 0)]
+								[Choice("Host Default (max \(ParsecVideoSuspendPolicy.maxSafeHostBitrate))", 0)]
 								+ ParsecResolution.bitrates
 									.filter { $0 <= ParsecVideoSuspendPolicy.maxSafeHostBitrate }
 									.map { Choice("\($0) Mbps", $0) })

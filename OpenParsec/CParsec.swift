@@ -265,14 +265,14 @@ protocol ParsecSessionServicing {
 	func sendUserData(type: ParsecUserDataType, message: Data)
 	func updateHostVideoConfig()
 	var isAudioKeepAliveActive: Bool { get }
-	/// Pauses host video and parks the decoder across a resign-active window
-	/// (see ParsecVideoSuspendPolicy). Audio keeps flowing.
-	func setVideoSuspended(_ suspended: Bool)
+	/// Pauses host video across a resign-active window; `stopStream` (real
+	/// background) also stops the stream (see ParsecSDKBridge). Audio keeps flowing.
+	func setVideoSuspended(_ suspended: Bool, stopStream: Bool)
 }
 
 extension ParsecSessionServicing {
 	var isAudioKeepAliveActive: Bool { false }
-	func setVideoSuspended(_ suspended: Bool) {}
+	func setVideoSuspended(_ suspended: Bool, stopStream: Bool) {}
 }
 
 protocol ParsecRenderingServicing {
@@ -596,7 +596,7 @@ class CParsec
 		// the background → no -14) and start the background grace cap here.
 		if (initiationStatus == .ok || initiationStatus == .connecting),
 		   UIApplication.shared.applicationState == .background {
-			parsecImpl.setVideoSuspended(true)
+			parsecImpl.setVideoSuspended(true, stopStream: true)
 			ParsecBackgroundManager.shared.beginBackgroundGrace()
 		}
 		// ParsecClientConnect is asynchronous: PARSEC_OK means only that the
@@ -656,6 +656,8 @@ class CParsec
 	}
 
 	static func enterBackground(generation: UInt64? = nil) {
+		lifecycleLock.lock()
+		defer { lifecycleLock.unlock() }
 		let observedGeneration = generation ?? sessionSnapshot.generation
 		releaseAllMouseButtons(reason: .background)
 		releaseAllKeyboardKeys(reason: .background)
@@ -665,12 +667,16 @@ class CParsec
 	}
 
 	static func enterBackgroundGrace(generation: UInt64? = nil) {
+		lifecycleLock.lock()
+		defer { lifecycleLock.unlock() }
 		let observedGeneration = generation ?? sessionSnapshot.generation
 		_ = sessionTracker.enterBackgroundGrace(generation: observedGeneration)
 		observeMediaRecovery()
 	}
 
 	static func resumeForeground(generation: UInt64? = nil) {
+		lifecycleLock.lock()
+		defer { lifecycleLock.unlock() }
 		let observedGeneration = generation ?? sessionSnapshot.generation
 		_ = sessionTracker.resumeForeground(generation: observedGeneration)
 		observeMediaRecovery()
@@ -782,11 +788,11 @@ class CParsec
 		parsecImpl.updateHostVideoConfig()
 	}
 
-	static func setVideoSuspended(_ suspended: Bool) {
+	static func setVideoSuspended(_ suspended: Bool, stopStream: Bool = false) {
 		// Same lock as getStatusEx, which drives the resume recovery check.
 		lifecycleLock.lock()
 		defer { lifecycleLock.unlock() }
-		parsecImpl.setVideoSuspended(suspended)
+		parsecImpl.setVideoSuspended(suspended, stopStream: stopStream)
 	}
 
 	static func sendMouseMessage(
@@ -1231,7 +1237,7 @@ final class ParsecConnectRunner {
 		let initial = CParsec.connect(peerID, intent: intent)
 		let generation = CParsec.sessionSnapshot.generation
 		Diagnostics.note("connect-attempt generation=\(generation) intent=\(intent) try=\(index) initial=\(initial.rawValue) app=\(UIApplication.shared.applicationState.rawValue) \(NetworkPathObserver.digest)")
-		timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] t in
+		let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] t in
 			guard let self, self.sequence == seq else { t.invalidate(); return }
 			// A connect that failed outright reports its real code; polling
 			// would only return -3 (not running) and hide it.
@@ -1266,5 +1272,8 @@ final class ParsecConnectRunner {
 			self.pendingRetry = work
 			DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
 		}
+		// .common: keep polling while the user scrolls the host list.
+		RunLoop.main.add(timer, forMode: .common)
+		self.timer = timer
 	}
 }
