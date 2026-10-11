@@ -199,6 +199,7 @@ enum Diagnostics {
 	}
 
 	static func peek() -> String? {
+		queue.sync {}  // readers see every line noted before the call
 		// Lossy decode: a trim can cut a multi-byte character in half.
 		guard let data = try? Data(contentsOf: logURL), !data.isEmpty else { return nil }
 		return String(decoding: data, as: UTF8.self)
