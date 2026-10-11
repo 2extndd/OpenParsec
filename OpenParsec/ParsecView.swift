@@ -1,5 +1,4 @@
 import SwiftUI
-import ParsecSDK
 import Foundation
 import AVFoundation
 
@@ -11,29 +10,53 @@ struct ParsecStatusBar : View {
 	@Binding var DCAlertText: String
 	@State var parsecViewController: ParsecViewController?
 	@State var wasDisconnected: Bool = true
-	// Consecutive non-OK polls before we believe the session is really gone.
-	// At a 0.2s poll interval, 5 ≈ 1s of grace — long enough to ride out a
-	// transient loss/RTT spike on a jittery link (BUD recovers on its own),
-	// short enough that a genuine drop still surfaces promptly.
-	@State var consecutiveFailures: Int = 0
-	private let disconnectFailureThreshold = 5
+	@State private var decodeErrorTolerated = false
+	// Pure policy owns the failure streak and one-reconnect budget; the
+	// background manager remains the only scheduler/effect owner.
+	@State private var transportRecovery = ParsecTransportRecoveryMonitor(
+		failureThreshold: 5
+	)
 	let timer = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
 
-	// Translate a raw ParsecStatus error into something a user can act on. The
-	// SDK returns bare integers; the worst case is a session that drops with an
-	// opaque "-6023" the user can't interpret. Known codes get a plain-language
-	// reason; the raw code is always appended so we can still triage anything new.
-	static func disconnectMessage(forCode code: Int) -> String {
+	// Translate a raw SDK status into something a user can act on; the raw
+	// code is always appended so anything new can still be triaged. Meanings
+	// follow parsec.h and Parsec's published error-code articles.
+	static func failureMessage(forCode code: Int, connecting: Bool = false) -> String {
+		let prefix = connecting ? "Couldn't connect" : "Disconnected"
+		let reason: String
 		switch code {
-		case -6023, -6024:
-			// Parsec: "Unable To Negotiate A Successful Connection" — a network/NAT
-			// problem, not an app bug. The iPad and host couldn't open a P2P tunnel.
-			// Only these two are documented; everything else shows the raw code so
-			// we never present an unverified reason as fact.
-			return "Disconnected: couldn't reach the host (network/NAT). Check Wi-Fi, firewall, and the host's UPnP / port-forwarding.\n(code \(code))"
+		case -6013:
+			reason = "UDP traffic is blocked. A VPN that doesn't pass UDP is the usual cause: use split tunneling (VPN only for *.parsec.app) or turn the VPN off once connected."
+		case -6023, -6024, -6025, -6033:
+			reason = "a peer-to-peer connection couldn't be negotiated (network/NAT). Check Wi-Fi, the host's firewall, and UPnP / port forwarding."
+		case -6101, -6105, -6106, -3002, -3003, -3009:
+			reason = "Parsec's servers couldn't be reached. They are needed to start or restore a connection; where Parsec is blocked, turn on a VPN for *.parsec.app."
+		case -3008:
+			reason = "your Parsec session is no longer valid. Sign in again."
+		case -12007, -12019:
+			reason = "the network was interrupted."
+		case 4:
+			reason = "the host shut down or stopped hosting."
+		case 5:
+			reason = "the host disconnected you."
+		case 8:
+			reason = "the host declined the connection."
+		case 9:
+			reason = "the connection was canceled."
+		case 11:
+			reason = "the host has no free guest slots."
+		case 99:
+			reason = "the host is no longer available."
+		case 112:
+			reason = "you don't have permission to connect to this host."
 		default:
-			return "Disconnected (code \(code))"
+			return "\(prefix) (code \(code))"
 		}
+		return "\(prefix): \(reason)\n(code \(code))"
+	}
+
+	static func disconnectMessage(forCode code: Int) -> String {
+		failureMessage(forCode: code)
 	}
 
 	init(isReconfiguring: Binding<Bool>, showMenu: Binding<Bool>, showDCAlert: Binding<Bool>, DCAlertText: Binding<String>, parsecViewController: ParsecViewController) {
@@ -108,11 +131,42 @@ struct ParsecStatusBar : View {
 		{
 			return // no need to poll if we aren't connected anymore
 		}
+
+		// The background manager exclusively owns grace expiry and foreground
+		// recovery. Real ParsecSDK status can be transiently unavailable while
+		// iPadOS backgrounds render/network work; counting those polls as transport
+		// failures tears down the session before the grace window can do its job.
+		guard ParsecTransportObservationPolicy.isAllowed(
+			applicationState: UIApplication.shared.applicationState
+		) else {
+			return
+		}
+		// Between connect retries the SDK is intentionally disconnected (-3);
+		// the runner owns the outcome and reports it itself.
+		if ParsecConnectRunner.shared.isRunning { return }
 		
-		var pcs = ParsecClientStatus()
-		let status = CParsec.getStatusEx(&pcs)
+		let generation = CParsec.sessionSnapshot.generation
+		let clientStatus = CParsec.getStatusEx(generation: generation)
+		guard CParsec.sessionSnapshot.generation == generation else { return }
+		// Decoder errors (-10…-23) are sticky in GetStatus until the next connect,
+		// but the SDK re-creates the hardware decoder itself: after even a 1 s
+		// app switch iPadOS reclaims it, GetStatus says -14 forever, and frames
+		// keep flowing. Treat that as healthy while new frames arrive; only a
+		// real gap (no new frame for 3 s) counts as a transport failure.
+		let status = ParsecDecodeErrorPolicy.effectiveStatus(
+			clientStatus.status,
+			secondsSinceNewFrame: CACurrentMediaTime() - RenderClock.lastNewFrameAt
+		)
+		if status != clientStatus.status, !decodeErrorTolerated {
+			decodeErrorTolerated = true
+			Diagnostics.note("decode-error-tolerated status=\(clientStatus.status.rawValue) generation=\(generation)")
+		}
+		RenderClock.check(
+			paused: (parsecViewController?.glkView as? ParsecGLKViewController)?.glkViewController.isPaused ?? false,
+			detail: "status=\(status.rawValue) queued=\(clientStatus.metrics.queuedFrames) decodeMs=\(String(format: "%.1f", clientStatus.metrics.decodeLatency)) encodeMs=\(String(format: "%.1f", clientStatus.metrics.encodeLatency)) netMs=\(String(format: "%.1f", clientStatus.metrics.networkLatency)) app=\(UIApplication.shared.applicationState.rawValue)"
+		)
 		
-		if status != PARSEC_OK
+		if status != .ok
 		{
 			if ParsecBackgroundManager.shared.isMarkedForReconnect {
 				return
@@ -125,34 +179,68 @@ struct ParsecStatusBar : View {
 				pipActive = PictureInPictureManager.shared.isPiPActive
 			}
 			if pipActive {
-				CParsec.disconnect()
-				try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-				ParsecBackgroundManager.shared.connectionDidEnd()
-				ParsecBackgroundManager.shared.markForReconnect()
-				wasDisconnected = true
+				let disconnected = CParsec.disconnect(
+					reason: .transportFailure,
+					generation: generation
+				)
+				if disconnected {
+					ParsecBackgroundManager.shared.markForReconnect()
+					wasDisconnected = true
+				}
 				return
 			}
 
-			// Debounce transient loss: a single bad poll on a jittery link is
-			// usually the BUD transport mid-recovery, not a real disconnect.
-			// Only alert after the status has been non-OK for several polls in
-			// a row; a genuine drop persists and still surfaces within ~1s.
-			consecutiveFailures += 1
-			if consecutiveFailures >= disconnectFailureThreshold {
+			let effect = transportRecovery.observe(
+				status: status,
+				generation: generation,
+				isReplacementGeneration: CParsec.sessionSnapshot.connectIntent == .reconnect,
+				isSessionInteractive: CParsec.sessionSnapshot.phase == .interactive
+			)
+			CParsec.publishTransportRecovery(transportRecovery.snapshot)
+			if let effect {
+				Diagnostics.note("transport-\(effect) status=\(status.rawValue) generation=\(generation) \(NetworkPathObserver.digest)")
+			}
+			switch effect {
+			case let .reconnect(recoveryGeneration):
 				wasDisconnected = true
-				DCAlertText = Self.disconnectMessage(forCode: Int(status.rawValue))
+				let disconnected = CParsec.disconnect(
+					reason: .transportFailure,
+					generation: recoveryGeneration
+				)
+				if disconnected {
+					ParsecBackgroundManager.shared.schedulePendingReconnect()
+				}
+			case let .terminal(_, terminalStatus):
+				wasDisconnected = true
+				DCAlertText = Self.disconnectMessage(
+					forCode: Int(terminalStatus.rawValue)
+				)
 				showDCAlert = true
+			case nil:
+				break
 			}
 			return
 		}
 
-		// Status is OK — clear any in-flight failure streak.
-		consecutiveFailures = 0
+		// Status is OK — clear any in-flight failure streak and retire a
+		// replacement generation's reconnect budget once it is interactive.
+		_ = transportRecovery.observe(
+			status: status,
+			generation: generation,
+			isReplacementGeneration: CParsec.sessionSnapshot.connectIntent == .reconnect,
+			isSessionInteractive: CParsec.sessionSnapshot.phase == .interactive
+		)
+		CParsec.publishTransportRecovery(transportRecovery.snapshot)
+		ParsecBackgroundManager.shared.foregroundTransportRemainedUsable(
+			generation: generation
+		)
 
 		if showMenu
 		{
-			let str = String.fromBuffer(&pcs.decoder.0.name.0, length:16)
-			metricInfo = "Decode \(String(format:"%.2f", pcs.`self`.metrics.0.decodeLatency))ms    Encode \(String(format:"%.2f", pcs.`self`.metrics.0.encodeLatency))ms    Network \(String(format:"%.2f", pcs.`self`.metrics.0.networkLatency))ms    Bitrate \(String(format:"%.2f", pcs.`self`.metrics.0.bitrate))Mbps    \(pcs.decoder.0.h265 ? "H265" : "H264") \(pcs.decoder.0.width)x\(pcs.decoder.0.height) \(pcs.decoder.0.color444 ? "4:4:4" : "4:2:0") \(str)"
+			let metrics = clientStatus.metrics
+			let decoder = clientStatus.decoder
+			let snapshot = CParsec.sessionSnapshot
+			metricInfo = "\(snapshot.digest)\nDecode \(String(format:"%.2f", metrics.decodeLatency))ms    Encode \(String(format:"%.2f", metrics.encodeLatency))ms    Network \(String(format:"%.2f", metrics.networkLatency))ms    Bitrate \(String(format:"%.2f", metrics.bitrate))Mbps    Queue \(metrics.queuedFrames)    RT \(metrics.fastRetransmits)/\(metrics.slowRetransmits)    \(decoder.usesH265 ? "H265" : "H264") \(decoder.width)x\(decoder.height) \(decoder.usesColor444 ? "4:4:4" : "4:2:0") \(decoder.name)"
 		}
 	}
 }
@@ -173,10 +261,12 @@ struct ParsecView: View
 	
 	@State var showDCAlert: Bool = false
 	@State var DCAlertText: String = "Disconnected (reason unknown)"
+	@State private var mediaRecoveryTerminal: Bool = false
 	@State var metricInfo: String = "Loading..."
 	
 	@State var hideOverlay: Bool = false
 	@State var showMenu: Bool = false
+	@State private var showSettings: Bool = false
 
 	@State var showKeyboard: Bool = false
 	@State var zoomEnabled: Bool = false
@@ -184,6 +274,7 @@ struct ParsecView: View
 	// Suppresses the status-bar disconnect alert and shows a small
 	// "Switching resolution…" overlay so the user knows what's happening.
 	@State var isReconfiguring: Bool = false
+	@State private var hostConfigRequestGate = ParsecGenerationRequestGate()
 
 	@State var muted: Bool = false
 	@State var preferH265: Bool = true
@@ -234,6 +325,10 @@ struct ParsecView: View
 				.prefersPersistentSystemOverlaysHidden()
 			
 			ParsecStatusBar(isReconfiguring: $isReconfiguring, showMenu: $showMenu, showDCAlert: $showDCAlert, DCAlertText: $DCAlertText, parsecViewController: parsecViewController)
+
+			if OpenParsecRuntime.isUITesting {
+				SessionDiagnosticsAccessibilityView(exposesPhase: true)
+			}
 			
 			VStack()
 			{
@@ -253,13 +348,15 @@ struct ParsecView: View
 							Image("IconTransparent")
 								.resizable()
 								.aspectRatio(contentMode: .fit)
-								.frame(width:48, height:48)
+								.frame(width:34, height:34)
+								.padding(3)
 								.background(Rectangle().fill(Color("BackgroundPrompt").opacity(showMenu ? 0.75 : 1)))
-								.cornerRadius(8)
-								.opacity(showMenu ? 1 : 0.25)
+								.cornerRadius(10)
+								.opacity(showMenu ? 1 : 0.22)
 						}
-						.padding()
+						.padding(10)
 						.edgesIgnoringSafeArea(.all)
+						.accessibilityIdentifier("openparsec.session")
 						Spacer()
 					}
 					if SettingsHandler.showKeyboardButton {
@@ -270,13 +367,13 @@ struct ParsecView: View
 								Image(systemName: "keyboard")
 									.resizable()
 									.aspectRatio(contentMode: .fit)
-									.frame(width:32, height:32)
+									.frame(width:24, height:24)
 									.foregroundColor(Color("Foreground"))
-									.padding(8)
+									.padding(7)
 									.background(Rectangle().fill(Color("BackgroundPrompt").opacity(showKeyboard ? 0.75 : 0.5)))
 									.cornerRadius(8)
 							}
-							.padding(.leading)
+							.padding(.leading, 10)
 							.edgesIgnoringSafeArea(.all)
 							Spacer()
 						}
@@ -287,19 +384,29 @@ struct ParsecView: View
 				{	
 					HStack()
 					{
-						VStack(spacing:3)
+						VStack(spacing:1)
 						{
+							Button(action: { showSettings = true; showMenu = false })
+							{
+								Text("Settings")
+									.padding(.vertical, 7)
+									.padding(.horizontal, 8)
+									.frame(maxWidth:.infinity)
+									.multilineTextAlignment(.center)
+							}
 							Button(action:disableOverlay)
 							{
 								Text("Hide Overlay")
-									.padding(8)
+									.padding(.vertical, 7)
+									.padding(.horizontal, 8)
 									.frame(maxWidth:.infinity)
 									.multilineTextAlignment(.center)
 							}
 							Button(action: toggleMute)
 							{
 								Text("Sound: \(muted ? "OFF" : "ON")")
-									.padding(8)
+									.padding(.vertical, 7)
+									.padding(.horizontal, 8)
 									.frame(maxWidth:.infinity)
 									.multilineTextAlignment(.center)
 							}
@@ -325,7 +432,8 @@ struct ParsecView: View
 								}
 							} label: {
 								Text("Resolution")
-									.padding(8)
+									.padding(.vertical, 7)
+									.padding(.horizontal, 8)
 									.frame(maxWidth:.infinity)
 									.multilineTextAlignment(.center)
 							}
@@ -346,18 +454,40 @@ struct ParsecView: View
 								}
 							} label: {
 								Text("Bitrate")
-									.padding(8)
+									.padding(.vertical, 7)
+									.padding(.horizontal, 8)
 									.frame(maxWidth:.infinity)
 									.multilineTextAlignment(.center)
 							}
-							if (DataManager.model.displayConfigs.count > 1) {
+							if let target = ParsecDisplayConfig.toggleTarget(in: dataModel.displayConfigs, current: dataModel.output) {
+								// Two monitors: one tap flips to the other one.
+								Button(action: { changeDisplay(displayId: target.id) }) {
+									Text("Switch to \(target.menuLabel(in: dataModel.displayConfigs))")
+										.padding(.vertical, 7)
+										.padding(.horizontal, 8)
+										.frame(maxWidth:.infinity)
+										.multilineTextAlignment(.center)
+								}
+							} else if (dataModel.displayConfigs.count > 2) {
 								Menu() {
-									Button("Auto") {
-										changeDisplay(displayId: "none")
+									Button(action: { changeDisplay(displayId: "none") }) {
+										HStack {
+											Text("Auto")
+											if dataModel.output == "none" {
+												Spacer(minLength: 8)
+												Image(systemName: "checkmark")
+											}
+										}
 									}
-									ForEach(DataManager.model.displayConfigs, id: \.self) { config in
-										Button("\(config.name) \(config.adapterName)") {
-											changeDisplay(displayId: config.id)
+									ForEach(dataModel.displayConfigs, id: \.self) { config in
+										Button(action: { changeDisplay(displayId: config.id) }) {
+											HStack {
+												Text(config.menuLabel(in: dataModel.displayConfigs))
+												if config.id == dataModel.output {
+													Spacer(minLength: 8)
+													Image(systemName: "checkmark")
+												}
+											}
 										}
 									}
 								} label: {
@@ -370,15 +500,31 @@ struct ParsecView: View
 
 							Button(action: toggleConstantFps)
 							{
-								Text("Constant FPS: \(constantFps ? "ON" : "OFF")")
-									.padding(8)
+								Text("Constant FPS: \(dataModel.constantFps ? "ON" : "OFF")")
+									.padding(.vertical, 7)
+									.padding(.horizontal, 8)
 									.frame(maxWidth:.infinity)
 									.multilineTextAlignment(.center)
+							}
+							if CParsec.hostOS != .windows {
+								// macOS "Turn Dock hiding on/off" is ⌥⌘D.
+								Button(action: {
+									let chord = ["LGUI", "LALT", "D"].compactMap(KeyCodeTranslators.parsecKeyCodeTranslator)
+									CParsec.sendKeyboardChord(chord, route: .explicitMacro, mappingIntent: .raw)
+								})
+								{
+									Text("Hide / Show Dock")
+										.padding(.vertical, 7)
+										.padding(.horizontal, 8)
+										.frame(maxWidth:.infinity)
+										.multilineTextAlignment(.center)
+								}
 							}
 							Button(action: toggleZoom)
 							{
 								Text("Zoom: \(zoomEnabled ? "ON" : "OFF")")
-									.padding(8)
+									.padding(.vertical, 7)
+									.padding(.horizontal, 8)
 									.frame(maxWidth:.infinity)
 									.multilineTextAlignment(.center)
 							}
@@ -390,15 +536,17 @@ struct ParsecView: View
 							{
 								Text("Disconnect")
 									.foregroundColor(.red)
-									.padding(8)
+									.padding(.vertical, 7)
+									.padding(.horizontal, 8)
 									.frame(maxWidth:.infinity)
 									.multilineTextAlignment(.center)
 							}
 						}
-						.background(Rectangle().fill(Color("BackgroundPrompt").opacity(0.75)))
+						.font(.subheadline)
+						.background(Rectangle().fill(Color("BackgroundPrompt").opacity(0.8)))
 						.foregroundColor(Color("Foreground"))
-						.frame(maxWidth:175)
-						.cornerRadius(8)
+						.frame(maxWidth:160)
+						.cornerRadius(10)
 						.padding(.horizontal)
 						//.edgesIgnoringSafeArea(.all)
 						Spacer()
@@ -407,64 +555,180 @@ struct ParsecView: View
 				Spacer()
 			}
 			.zIndex(2)
+
+			// In-session settings: "live" settings apply immediately through
+			// SettingsHandler.notifyChanged; connect-time ones on next connect.
+			SettingsView(visible: $showSettings)
+				.zIndex(3)
 		}
 		.statusBarHidden(SettingsHandler.hideStatusBar)
+		.onChange(of: showMenu) { _ in
+			// Trackpad clicks on the session menu must not also click the host.
+			ParsecViewController.sessionOverlayActive = showMenu || showSettings
+			parsecViewController.setNeedsUpdateOfPrefersPointerLocked()
+			parsecViewController.setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
+		}
+		.onChange(of: showSettings) { visible in
+			ParsecViewController.sessionOverlayActive = showMenu || visible
+			// "Hide Session Button" applies as soon as Settings closes.
+			if !visible { hideOverlay = SettingsHandler.noOverlay }
+			parsecViewController.setNeedsUpdateOfPrefersPointerLocked()
+			parsecViewController.setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
+		}
 		.alert(isPresented:$showDCAlert)
 		{
-			Alert(title: Text(DCAlertText), dismissButton:.default(Text("Close"), action:{disconnect()}))
+			Alert(
+				title: Text(DCAlertText),
+				dismissButton: .default(
+					Text("Close"),
+					action: {
+						let reason: ParsecDisconnectReason = mediaRecoveryTerminal
+							? .user
+							: .transportFailure
+						mediaRecoveryTerminal = false
+						disconnect(reason: reason)
+					}
+				)
+			)
 		}
 		.onAppear(perform:post)
 		.onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("ParsecBackgroundDisconnect"))) { _ in
+			var pictureInPictureActive = false
 			if #available(iOS 15.0, *) {
-				if PictureInPictureManager.shared.isPiPActive {
-					return
+				pictureInPictureActive = PictureInPictureManager.shared.isPiPActive
+			}
+			let automaticReconnectPending = ParsecBackgroundManager.shared.isMarkedForReconnect
+			let preservesBackgroundPresentation = ParsecBackgroundManager.shared.shouldPreserveSessionPresentation
+			guard ParsecRecoveryPresentationPolicy.shouldDismissSession(
+				pictureInPictureActive: pictureInPictureActive,
+				automaticReconnectPending: automaticReconnectPending,
+				preservesBackgroundPresentation: preservesBackgroundPresentation
+			) else {
+				if !pictureInPictureActive,
+				   automaticReconnectPending,
+				   preservesBackgroundPresentation {
+					// Stop drawing against the disconnected SDK generation. The
+					// validated replacement resumes this same GLK surface below.
+					parsecViewController.glkView?.cleanUp()
 				}
+				return
 			}
 			disconnect(isBackgroundDisconnect: true)
+		}
+		.onReceive(
+			NotificationCenter.default.publisher(for: .parsecSessionSnapshotDidChange)
+		) { notification in
+			guard let snapshot = notification.object as? ParsecSessionSnapshot,
+			      snapshot.connectIntent == .reconnect,
+			      snapshot.transportStatus == .ok,
+			      CParsec.sessionSnapshot.generation == snapshot.generation else { return }
+			var requestGate = hostConfigRequestGate
+			let shouldRequestHostConfig = requestGate.claim(
+				generation: snapshot.generation
+			)
+			hostConfigRequestGate = requestGate
+			DispatchQueue.main.async {
+				parsecViewController.replaceRenderSurfaceForReconnect(
+					generation: snapshot.generation
+				)
+				if shouldRequestHostConfig {
+					getHostUserData()
+					Diagnostics.note(
+						"host-config event=request generation=\(snapshot.generation) reason=reconnect"
+					)
+				}
+			}
+		}
+		.onReceive(
+			NotificationCenter.default.publisher(for: .parsecDisplayOutputDidConfirm)
+		) { _ in
+			// Confirms can land seconds after changeDisplay's fixed 1 s resume
+			// (device log: 4 s on restore); repaint after the host's encoder reset too.
+			parsecViewController.glkView?.resume()
+			parsecViewController.synchronizeRenderDimensions()
+		}
+		.onReceive(
+			NotificationCenter.default.publisher(for: .parsecMediaRecoveryActionRequested)
+		) { notification in
+			guard let action = notification.object as? ParsecMediaRecoveryAction else { return }
+			handleMediaRecoveryAction(action)
 		}
 		.edgesIgnoringSafeArea(.all)
 
 	}
 	
+	private func handleMediaRecoveryAction(_ action: ParsecMediaRecoveryAction) {
+		Diagnostics.note("media-recovery action=\(action) \(CParsec.sessionSnapshot.digest)")
+		switch action {
+		case let .resumeVideoSurface(generation):
+			guard CParsec.sessionSnapshot.generation == generation else { return }
+			parsecViewController.glkView?.resume()
+		case let .reconnect(generation):
+			guard CParsec.sessionSnapshot.generation == generation else { return }
+			disconnect(
+				isBackgroundDisconnect: true,
+				reason: .transportFailure
+			)
+			ParsecBackgroundManager.shared.sceneDidBecomeActive()
+		case let .terminalFailure(generation, stage):
+			guard CParsec.sessionSnapshot.generation == generation else { return }
+			ParsecBackgroundManager.shared.disableAutoReconnect()
+			mediaRecoveryTerminal = true
+			let channel = stage == .audio ? "Audio" : "Video"
+			let code = CParsec.sessionSnapshot.lastFailure?.rawCode ?? 0
+			DCAlertText = "\(channel) did not recover after one automatic reconnect (code \(code))."
+			showDCAlert = true
+		}
+	}
+
 	func post()
 	{
+		let recoverySnapshot = CParsec.mediaRecoverySnapshot
+		if recoverySnapshot.phase == .terminalFailure,
+		   let stage = CParsec.sessionSnapshot.lastFailure?.stage {
+			handleMediaRecoveryAction(
+				.terminalFailure(
+					generation: recoverySnapshot.generation,
+					stage: stage
+				)
+			)
+		}
+
 		ParsecBackgroundManager.shared.onShouldDisconnect = {
 			NotificationCenter.default.post(name: NSNotification.Name("ParsecBackgroundDisconnect"), object: nil)
 		}
 		if #available(iOS 15.0, *) {
-			PictureInPictureManager.shared.onPiPStopped = { [self] in
-				if UIApplication.shared.applicationState != .active {
-					// Synchronous — DispatchQueue.main.async may never execute if iOS suspends the app
-					CParsec.disconnect()
-					try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-					ParsecBackgroundManager.shared.markForReconnect()
-					DispatchQueue.main.async {
-						self.disconnect(isBackgroundDisconnect: true)
-					}
-				} else {
-					if ParsecBackgroundManager.shared.isReconnecting {
-						return
-					}
-					// Check actual Parsec status — timers don't reliably fire in background
-					var pcs = ParsecClientStatus()
-					let currentStatus = CParsec.getStatusEx(&pcs)
-					if currentStatus != PARSEC_OK || ParsecBackgroundManager.shared.isMarkedForReconnect {
-						CParsec.disconnect()
-						try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-						ParsecBackgroundManager.shared.markForReconnect()
-						DispatchQueue.main.async {
-							self.disconnect(isBackgroundDisconnect: true)
-						}
-					}
+			PictureInPictureManager.shared.onPiPStarted = { protectedGeneration in
+				ParsecBackgroundManager.shared.pictureInPictureDidStart(
+					generation: protectedGeneration
+				)
+			}
+			PictureInPictureManager.shared.onPiPStopped = { protectedGeneration in
+				let isBackgrounded = UIApplication.shared.applicationState != .active
+				if isBackgrounded {
+					ParsecBackgroundManager.shared.pictureInPictureProtectionEnded(
+						whileBackgrounded: true,
+						generation: protectedGeneration
+					)
+					return
+				}
+
+				guard !ParsecBackgroundManager.shared.isReconnecting else { return }
+				let currentStatus = CParsec.getStatusEx(
+					generation: protectedGeneration
+				).status
+				guard CParsec.sessionSnapshot.generation == protectedGeneration else { return }
+				if currentStatus != .ok || ParsecBackgroundManager.shared.isMarkedForReconnect {
+					_ = ParsecBackgroundManager.shared.transportBecameUnusable(
+						generation: protectedGeneration
+					)
 				}
 			}
-			PictureInPictureManager.shared.onPiPStartFailed = { [self] in
-				if UIApplication.shared.applicationState != .active {
-					ParsecBackgroundManager.shared.markForReconnect()
-					DispatchQueue.main.async {
-						self.disconnect(isBackgroundDisconnect: true)
-					}
-				}
+			PictureInPictureManager.shared.onPiPStartFailed = { protectedGeneration in
+				ParsecBackgroundManager.shared.pictureInPictureProtectionEnded(
+					whileBackgrounded: UIApplication.shared.applicationState != .active,
+					generation: protectedGeneration
+				)
 			}
 		}
 
@@ -472,20 +736,25 @@ struct ParsecView: View
 		CParsec.setMuted(muted)
 		parsecViewController.setZoomEnabled(zoomEnabled)
 
-		if SettingsHandler.saveSessionSettings {
-			DataManager.model.constantFps = constantFps
-		}
+		// Seed the session's Constant FPS (saved value, else OFF) — the first
+		// case-11 echo keeps it and pushes it instead of adopting host default.
+		DataManager.model.constantFps = constantFps
 
 		let screenSize: CGSize = self.parsecViewController.view.frame.size
 		let scaleFactor = UIScreen.main.nativeScale
-		ParsecResolution.updateClientResolution(width: Int(screenSize.width * scaleFactor), height: Int(screenSize.height * scaleFactor))
+		ParsecResolution.updateClientResolution(
+			width: Int(screenSize.width * scaleFactor),
+			height: Int(screenSize.height * scaleFactor)
+		)
 
 		getHostUserData()
 
 		hideOverlay = SettingsHandler.noOverlay
 
-        parsecViewController.onKeyboardVisibilityChanged = { visible in
-            showKeyboard = visible
+        // Capture only the binding: capturing the view struct retained the
+        // StateObject (and so the controller) from inside the controller.
+        parsecViewController.onKeyboardVisibilityChanged = { [binding = $showKeyboard] visible in
+            binding.wrappedValue = visible
         }
 
 		parsecViewController.setKeyboardVisible(showKeyboard)
@@ -530,17 +799,25 @@ struct ParsecView: View
 		return ActionSheet(title: Text("Select a Display:"), buttons:buttons + [Alert.Button.cancel()])
 	}*/
 
-	func disconnect(isBackgroundDisconnect: Bool = false)
+	func disconnect(
+		isBackgroundDisconnect: Bool = false,
+		reason: ParsecDisconnectReason? = nil
+	)
 	{
 		if !isBackgroundDisconnect {
 			ParsecBackgroundManager.shared.disableAutoReconnect()
 		}
+		// Leaving the session must stop any pending connect retry, or a later
+		// retry would pull the user back into the session they closed.
+		ParsecConnectRunner.shared.cancel()
 
 		if #available(iOS 15.0, *) {
 			PictureInPictureManager.shared.teardown()
 		}
 
-		CParsec.disconnect()
+		let disconnectReason = reason
+			?? (isBackgroundDisconnect ? .backgroundExpired : (showDCAlert ? .transportFailure : .user))
+		CParsec.disconnect(reason: disconnectReason)
 		self.parsecViewController.glkView.cleanUp()
 
 		parsecViewController.scrollView.zoomScale = 1.0
@@ -589,14 +866,20 @@ struct ParsecView: View
 			if let parsecGLK = self.parsecViewController.glkView as? ParsecGLKViewController {
 				parsecGLK.glkViewController.isPaused = true
 			}
-			CParsec.disconnect()
+			CParsec.disconnect(reason: .reconfigure)
 		}
 		// 600 ms gives the SDK enough time to fully tear down the session
 		// (audio queue, poll loops, internal state) before we reconnect.
 		// The user previously saw "Disconnected 20" with a 100 ms gap —
 		// turns out the SDK isn't truly ready for connect() that fast.
 		DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-			let status = CParsec.connect(peerID)
+			// The user may have left the session in these 0.6 s; connecting
+			// now would start a hidden session with no UI.
+			guard self.parsecViewController.viewIfLoaded?.window != nil else {
+				self.isReconfiguring = false
+				return
+			}
+			let status = CParsec.connect(peerID, intent: .reconfigure)
 			// connect() already installs the fresh ParsecClientConfig with the
 			// new resolution; calling applyConfig() right after would issue a
 			// redundant ParsecClientSetConfig against a just-negotiated
@@ -608,7 +891,7 @@ struct ParsecView: View
 			// If the reconnect didn't take (host offline, network blip),
 			// surface a real error instead of leaving the user staring at
 			// a frozen frame behind the spinner.
-			if status != PARSEC_OK && status != PARSEC_CONNECTING {
+			if status != .ok && status != .connecting {
 				self.isReconfiguring = false
 				self.DCAlertText = "Reconnect failed (code \(status.rawValue))"
 				self.showDCAlert = true
@@ -624,10 +907,11 @@ struct ParsecView: View
 	}
 
 	func changeBitRate(bitrate: Int) {
-		SettingsHandler.bitrate = bitrate
-
 		DispatchQueue.main.async {
+			// Model first: the Settings observer of the persisted key then sees
+			// the value as already applied and doesn't push it a second time.
 			DataManager.model.bitrate = bitrate
+			SettingsHandler.bitrate = bitrate
 			CParsec.updateHostVideoConfig()
 		}
 	}
@@ -658,20 +942,24 @@ struct ParsecView: View
 	
 	func changeDisplay(displayId: String) {
 		DispatchQueue.main.async {
+			Diagnostics.note("display-output event=request output=\(displayId) previous=\(DataManager.model.output)")
 			DataManager.model.output = displayId
 			// Persist so the next connect can auto-restore this choice once
 			// the host enumerates displays (user-data event 12). "none" is
 			// the "Auto" pseudo-id and isn't worth remembering.
-			if displayId == "none" {
+			if !SettingsHandler.saveSessionSettings {
+				// "Save Session Settings" off: don't remember the display.
+			} else if displayId == "none" {
 				SettingsHandler.savedDisplayOutput = ""
 				SettingsHandler.savedDisplayName = ""
 			} else {
 				SettingsHandler.savedDisplayOutput = displayId
 				// Also persist the human-readable name so a regenerated id
 				// next session can be matched by name.
-				if let cfg = DataManager.model.displayConfigs.first(where: { $0.id == displayId }) {
-					SettingsHandler.savedDisplayName = "\(cfg.name) \(cfg.adapterName)"
-				}
+				// Never keep the previous display's name next to the new id:
+				// restore would then follow that name to the old monitor.
+				SettingsHandler.savedDisplayName = DataManager.model.displayConfigs
+					.first(where: { $0.id == displayId })?.label ?? ""
 			}
 
 			// S10: switching the streamed monitor makes the host re-init its

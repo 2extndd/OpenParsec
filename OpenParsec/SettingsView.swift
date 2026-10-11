@@ -5,32 +5,35 @@ struct SettingsView:View
 	@Binding var visible: Bool
 
 	//@State var renderer:RendererType = SettingsHandler.renderer
-	@AppStorage("resolution") var resolution: ParsecResolution = .client
-	@AppStorage("bitrate") var bitrate: Int = 0
-	@AppStorage("decoder") var decoder: DecoderPref = .h264
-	@AppStorage("cursorMode") var cursorMode: CursorMode = .touchpad
-	@AppStorage("cursorScale") var cursorScale: Double = 0.5
-	@AppStorage("mouseSensitivity") var mouseSensitivity: Double = 1.0
-	@AppStorage("mouseAcceleration") var mouseAcceleration: Double = 0.0
-	@AppStorage("localCursorOverlay") var localCursorOverlay: Bool = false
-	@AppStorage("scrollSensitivity") var scrollSensitivity: Double = 1.0
-	@AppStorage("naturalScrolling") var naturalScrolling: Bool = true
-	@AppStorage("captureSystemKeys") var captureSystemKeys: Bool = true
-	@AppStorage("windowsHostKeyboardRemap") var windowsHostKeyboardRemap: Bool = false
-	@AppStorage("noOverlay") var noOverlay: Bool = false
-	@AppStorage("hideStatusBar") var hideStatusBar: Bool = true
-	@AppStorage("rightClickPosition") var rightClickPosition: RightClickPosition = .firstFinger
-	@AppStorage("preferredFramesPerSecond") var preferredFramesPerSecond: Int = 0 // 0 = use device max (ProMotion)
-	@AppStorage("decoderCompatibility") var decoderCompatibility: Bool = false // Enable for stutter issues on some devices
-	@AppStorage("lowLatencyMode") var lowLatencyMode: Bool = false
-	@AppStorage("showKeyboardButton") var showKeyboardButton: Bool = true
-	@AppStorage("syncKeyboardLayout") var syncKeyboardLayout: Bool = true
-	@AppStorage("layoutSyncHotkey") var layoutSyncHotkey: LayoutSyncHotkey = .ctrlSpace
-	@AppStorage("ctrlShiftEmulatesCmdSpace") var ctrlShiftEmulatesCmdSpace: Bool = false
-	@AppStorage("backtickEmulatesCmdSpace") var backtickEmulatesCmdSpace: Bool = false
-	@AppStorage("saveSessionSettings") var saveSessionSettings: Bool = true
+	@AppStorage(ParsecSettingID.resolution.rawValue) var resolution: ParsecResolution = SettingsDefaults.resolution
+	@AppStorage(ParsecSettingID.decoder.rawValue) var decoder: DecoderPref = SettingsDefaults.decoder
+	@AppStorage(ParsecSettingID.cursorMode.rawValue) var cursorMode: CursorMode = SettingsDefaults.cursorMode
+	@AppStorage(ParsecSettingID.pointerPresentationMode.rawValue) var pointerPresentationMode: PointerPresentationMode = SettingsDefaults.pointerPresentationMode
+	@AppStorage(ParsecSettingID.cursorScale.rawValue) var cursorScale: Double = SettingsDefaults.cursorScale
+	@AppStorage(ParsecSettingID.mouseSensitivity.rawValue) var mouseSensitivity: Double = SettingsDefaults.mouseSensitivity
+	@AppStorage(ParsecSettingID.mouseAcceleration.rawValue) var mouseAcceleration: Double = SettingsDefaults.mouseAcceleration
+	@AppStorage(ParsecSettingID.scrollSensitivity.rawValue) var scrollSensitivity: Double = SettingsDefaults.scrollSensitivity
+	@AppStorage(ParsecSettingID.scrollGlideDuration.rawValue) var scrollGlideDuration: Double = SettingsDefaults.scrollGlideDuration
+	@AppStorage(ParsecSettingID.naturalScrolling.rawValue) var naturalScrolling: Bool = SettingsDefaults.naturalScrolling
+	@AppStorage(ParsecSettingID.captureSystemKeys.rawValue) var captureSystemKeys: Bool = SettingsDefaults.captureSystemKeys
+	@AppStorage(ParsecSettingID.hostShortcutToolbarMode.rawValue) var hostShortcutToolbarMode: HostShortcutToolbarMode = SettingsDefaults.hostShortcutToolbarMode
+	@AppStorage(ParsecSettingID.windowsKeyboardMode.rawValue) var windowsKeyboardMode: WindowsKeyboardMode = SettingsDefaults.windowsKeyboardMode
+	@AppStorage(ParsecSettingID.noOverlay.rawValue) var noOverlay: Bool = SettingsDefaults.noOverlay
+	@AppStorage(ParsecSettingID.hideStatusBar.rawValue) var hideStatusBar: Bool = SettingsDefaults.hideStatusBar
+	@AppStorage(ParsecSettingID.rightClickPosition.rawValue) var rightClickPosition: RightClickPosition = SettingsDefaults.rightClickPosition
+	@AppStorage(ParsecSettingID.preferredFramesPerSecond.rawValue) var preferredFramesPerSecond: Int = SettingsDefaults.preferredFramesPerSecond // 0 = use device max (ProMotion)
+	@AppStorage(ParsecSettingID.decoderCompatibility.rawValue) var decoderCompatibility: Bool = SettingsDefaults.decoderCompatibility // Enable for stutter issues on some devices
+	@AppStorage(ParsecSettingID.showKeyboardButton.rawValue) var showKeyboardButton: Bool = SettingsDefaults.showKeyboardButton
+	@AppStorage(ParsecSettingID.syncKeyboardLayout.rawValue) var syncKeyboardLayout: Bool = SettingsDefaults.syncKeyboardLayout
+	@AppStorage(ParsecSettingID.layoutSyncHotkey.rawValue) var layoutSyncHotkey: LayoutSyncHotkey = SettingsDefaults.layoutSyncHotkey
+	@AppStorage(ParsecSettingID.ctrlShiftEmulatesCmdSpace.rawValue) var ctrlShiftEmulatesCmdSpace: Bool = SettingsDefaults.ctrlShiftEmulatesCmdSpace
+	@AppStorage(ParsecSettingID.backtickEmulatesCmdSpace.rawValue) var backtickEmulatesCmdSpace: Bool = SettingsDefaults.backtickEmulatesCmdSpace
+	@AppStorage(ParsecSettingID.saveSessionSettings.rawValue) var saveSessionSettings: Bool = SettingsDefaults.saveSessionSettings
+	@AppStorage(ParsecSettingID.bitrate.rawValue) var bitrate: Int = SettingsDefaults.bitrate
 	@State private var crashCopied: Bool = false
 	@State private var diagCopied: Bool = false
+	@State private var keyProbeStarted: Bool = false
+	@State private var showConnectionTest: Bool = false
 	
 	let resolutionChoices: [Choice<ParsecResolution>]
 
@@ -91,214 +94,246 @@ struct SettingsView:View
 
 					ScrollView()
 					{
-                        CatTitle("Interactivity")
-                        CatList()
-                        {
-                            CatItem("Mouse Movement")
-                            {
-                                MultiPicker(selection:$cursorMode, options:
+						CatTitle("Stream")
+						CatList()
+						{
+							CatItem("Resolution")
+							{
+								MultiPicker(selection: $resolution, options:resolutionChoices)
+							}
+							CatItem("Max Bitrate")
+							{
+								MultiPicker(selection: $bitrate, options:
+								[Choice("Host Default", 0)]
+								+ ParsecResolution.bitrates.map { Choice("\($0) Mbps", $0) })
+							}
+							CatItem("Decoder")
+							{
+								MultiPicker(selection: $decoder, options:
 								[
-									Choice("Touchpad", CursorMode.touchpad),
-									Choice("Direct", CursorMode.direct)
+								Choice("H.264", DecoderPref.h264),
+								Choice("Prefer H.265", DecoderPref.h265)
 								])
-                            }
-							CatItem("Right Click Position")
+							}
+							CatItem("Decoder Compatibility (fixes stutter)")
 							{
-								MultiPicker(selection:$rightClickPosition, options:
+								Toggle("", isOn:$decoderCompatibility)
+								.frame(width:80)
+							}
+							CatItem("Local Display Refresh")
+							{
+								MultiPicker(selection: $preferredFramesPerSecond, options:
 								[
-									Choice("First Finger", RightClickPosition.firstFinger),
-									Choice("Middle", RightClickPosition.middle),
-									Choice("Second Finger", RightClickPosition.secondFinger)
+								Choice("Auto (Device Max)", 0),
+								Choice("120 FPS", 120),
+								Choice("60 FPS", 60),
+								Choice("30 FPS", 30)
 								])
 							}
-                            CatItem("Cursor Scale")
-                            {
-                                Slider(value: $cursorScale, in:0.1...4, step:0.1)
-									.frame(width: 200)
-								Text(String(format: "%.1f", cursorScale))
-                            }
-                            CatItem("Local Cursor Overlay")
-                            {
-                                Toggle("", isOn:$localCursorOverlay)
-                                    .frame(width:80)
-                            }
-							CatItem("Mouse Sensitivity")
+							CatItem("Poor Network Preset")
 							{
-								Slider(value: $mouseSensitivity, in:0.1...4, step:0.1)
-									.frame(width: 200)
-								Text(String(format: "%.1f", mouseSensitivity))
+								Button("Apply") {
+								SettingsHandler.applyPoorNetworkPreset()
+								}
 							}
-							CatItem("Mouse Acceleration")
+						}
+						CatTitle("Pointer & Trackpad")
+						CatList()
+						{
+							CatItem("Pointer Mode")
 							{
-								Slider(value: $mouseAcceleration, in:0...1.5, step:0.05)
-									.frame(width: 200)
-								Text(String(format: "%.2f", mouseAcceleration))
-							}
-							CatItem("Scroll Sensitivity")
-							{
-								Slider(value: $scrollSensitivity, in:0.1...4, step:0.1)
-									.frame(width: 200)
-								Text(String(format: "%.1f", scrollSensitivity))
+								MultiPicker(selection:$pointerPresentationMode, options:
+								[
+								Choice("Native (iPad pointer)", PointerPresentationMode.native),
+								Choice("Captured (games)", PointerPresentationMode.captured)
+								])
 							}
 							CatItem("Natural Scrolling")
 							{
 								Toggle("", isOn:$naturalScrolling)
-									.frame(width:80)
+								.frame(width:80)
 							}
-                        }
-                        CatTitle("Keyboard")
-                        CatList()
-                        {
-                            CatItem("Sync layout with host")
-                            {
-                                Toggle("", isOn:$syncKeyboardLayout)
-                                    .frame(width:80)
-                            }
-                            CatItem("Layout switch hotkey")
-                            {
-                                MultiPicker(selection:$layoutSyncHotkey, options:
-                                [
-                                    Choice("⌃ + Space (macOS default)", LayoutSyncHotkey.ctrlSpace),
-                                    Choice("⌃ + ⇧ (macOS alt)", LayoutSyncHotkey.ctrlShift),
-                                    Choice("⌘ + Space", LayoutSyncHotkey.cmdSpace),
-                                    Choice("⌥ + Space", LayoutSyncHotkey.altSpace),
-                                    Choice("Alt + Shift (Windows)", LayoutSyncHotkey.altShift),
-                                    Choice("Off", LayoutSyncHotkey.none)
-                                ])
-                            }
-                            CatItem("⌃⇧ → ⌘Space (Mac host)")
-                            {
-                                Toggle("", isOn:$ctrlShiftEmulatesCmdSpace)
-                                    .frame(width:80)
-                            }
-                            CatItem("` key → ⌘Space (language switch)")
-                            {
-                                Toggle("", isOn:$backtickEmulatesCmdSpace)
-                                    .frame(width:80)
-                            }
-                            CatItem("Capture System Shortcuts")
-                            {
-                                Toggle("", isOn:$captureSystemKeys)
-                                    .frame(width:80)
-                            }
-                            CatItem("Windows Host Remap")
-                            {
-                                Toggle("", isOn:$windowsHostKeyboardRemap)
-                                    .frame(width:80)
-                            }
-                        }
-                        CatTitle("Graphics")
-                        CatList()
-                        {
-                            /*CatItem("Renderer")
-                            {
-								SegmentPicker(selection:$renderer, options:
-								[
-									Choice("OpenGL", RendererType.opengl),
-									Choice("Metal", RendererType.metal)
-								])
-                                .frame(width:165)
-                            }*/
-							CatItem("Default Resolution")
+							CatItem("Scroll Speed")
 							{
-								MultiPicker(selection: $resolution, options:resolutionChoices)
+								Slider(value: $scrollSensitivity, in:0.1...4, step:0.1)
+								.frame(width: 200)
+								Text(String(format: "%.1f", scrollSensitivity))
 							}
-                            CatItem("Decoder")
-                            {
-								MultiPicker(selection: $decoder, options:
-								[
-									Choice("H.264", DecoderPref.h264),
-									Choice("Prefer H.265", DecoderPref.h265)
-								])
-                            }
-							CatItem("Frame Rate")
+							CatItem("Scroll Glide")
 							{
-								MultiPicker(selection: $preferredFramesPerSecond, options:
+								Slider(value: $scrollGlideDuration, in:0...1.2, step:0.1)
+								.frame(width: 200)
+								Text(
+								scrollGlideDuration == 0
+								? "Stops immediately"
+								: String(format: "Up to %.1f s", scrollGlideDuration)
+								)
+							}
+							CatItem("Pointer Speed (Captured mode)")
+							{
+								Slider(value: $mouseSensitivity, in:0.1...4, step:0.1)
+								.frame(width: 200)
+								Text(String(format: "%.1f", mouseSensitivity))
+							}
+							CatItem("Acceleration (Captured mode)")
+							{
+								Slider(value: $mouseAcceleration, in:0...1.5, step:0.05)
+								.frame(width: 200)
+								Text(String(format: "%.2f", mouseAcceleration))
+							}
+						}
+						CatTitle("Touchscreen")
+						CatList()
+						{
+							CatItem("Finger Mode")
+							{
+								MultiPicker(selection:$cursorMode, options:
 								[
-									Choice("Auto (Device Max)", 0),
-									Choice("120 FPS", 120),
-									Choice("60 FPS", 60),
-									Choice("30 FPS", 30)
+								Choice("Touchpad", CursorMode.touchpad),
+								Choice("Direct", CursorMode.direct)
 								])
 							}
-							CatItem("Decoder Compatibility")
+							CatItem("Two-Finger Tap Right Click At")
 							{
-								Toggle("", isOn:$decoderCompatibility)
-									.frame(width:80)
+								MultiPicker(selection:$rightClickPosition, options:
+								[
+								Choice("First Finger", RightClickPosition.firstFinger),
+								Choice("Middle", RightClickPosition.middle),
+								Choice("Second Finger", RightClickPosition.secondFinger)
+								])
 							}
-							CatItem("Low Latency Mode")
+							CatItem("Cursor Size")
 							{
-								Toggle("", isOn:$lowLatencyMode)
-									.frame(width:80)
-									.onChange(of: lowLatencyMode) { newValue in
-										if newValue {
-											// S08 — Poor-Network profile. Strip the latency-adding
-											// knobs AND cap bitrate: on a weak uplink an uncapped
-											// encoder outruns the link, and the resulting queue
-											// (bufferbloat) is what actually makes a stream feel
-											// laggy on bad WiFi. This trades sharpness for
-											// responsiveness — each knob stays individually
-											// overridable afterward.
-											preferredFramesPerSecond = 0     // device-max present rate
-											decoder = .h265                  // more quality per capped bit
-											noOverlay = true
-											decoderCompatibility = false     // compat decode path adds latency
-											bitrate = 5                      // poor-network ceiling (Mbps)
-										}
-									}
+								Slider(value: $cursorScale, in:0.1...4, step:0.1)
+								.frame(width: 200)
+								Text(String(format: "%.1f", cursorScale))
 							}
-                        }
-                        CatTitle("Misc")
-                        CatList()
-                        {
-                            CatItem("Never Show Overlay")
-                            {
-                                Toggle("", isOn:$noOverlay)
-                                    .frame(width:80)
-                            }
-							CatItem("Hide Status Bar")
+						}
+						CatTitle("Keyboard")
+						CatList()
+						{
+							CatItem("Capture ⌘ Shortcuts")
 							{
-								Toggle("", isOn:$hideStatusBar)
-									.frame(width:80)
+								Toggle("", isOn:$captureSystemKeys)
+								.frame(width:80)
 							}
+							CatItem("Shortcut Buttons Above Keyboard")
+							{
+								MultiPicker(selection:$hostShortcutToolbarMode, options:
+								[
+								Choice("Automatic", HostShortcutToolbarMode.automatic),
+								Choice("macOS", HostShortcutToolbarMode.macOS),
+								Choice("Windows", HostShortcutToolbarMode.windows),
+								Choice("Both", HostShortcutToolbarMode.both),
+								Choice("Off", HostShortcutToolbarMode.off)
+								])
+							}
+							CatItem("Windows Host: ⌘ Key Sends")
+							{
+								MultiPicker(selection:$windowsKeyboardMode, options:
+								[
+								Choice("Win key", WindowsKeyboardMode.direct),
+								Choice("Ctrl (⌘C = copy)", WindowsKeyboardMode.commandAsControl)
+								])
+							}
+						}
+						CatTitle("Language Switching")
+						CatList()
+						{
+							CatItem("Follow iPad Language (Globe)")
+							{
+								Toggle("", isOn:$syncKeyboardLayout)
+								.frame(width:80)
+							}
+							CatItem("Host Switch Shortcut")
+							{
+								MultiPicker(selection:$layoutSyncHotkey, options:
+								[
+								Choice("⌘ Space (Mac) / Win Space (PC)", LayoutSyncHotkey.cmdSpace),
+								Choice("⌃ Space", LayoutSyncHotkey.ctrlSpace),
+								Choice("⌃ + ⇧ (macOS alt)", LayoutSyncHotkey.ctrlShift),
+																Choice("⌥ + Space", LayoutSyncHotkey.altSpace),
+								Choice("Alt + Shift (Windows)", LayoutSyncHotkey.altShift),
+								Choice("Off", LayoutSyncHotkey.none)
+								])
+							}
+							CatItem("⌃⇧ Sends ⌘Space (Mac host)")
+							{
+								Toggle("", isOn:$ctrlShiftEmulatesCmdSpace)
+								.frame(width:80)
+							}
+							CatItem("` Key Sends ⌘Space (Mac host)")
+							{
+								Toggle("", isOn:$backtickEmulatesCmdSpace)
+								.frame(width:80)
+							}
+						}
+						CatTitle("Interface")
+						CatList()
+						{
 							CatItem("Show Keyboard Button")
 							{
 								Toggle("", isOn:$showKeyboardButton)
-									.frame(width:80)
+								.frame(width:80)
 							}
-							CatItem("Save Session Settings")
+							CatItem("Hide Status Bar")
+							{
+								Toggle("", isOn:$hideStatusBar)
+								.frame(width:80)
+							}
+							CatItem("Hide Session Button")
+							{
+								Toggle("", isOn:$noOverlay)
+								.frame(width:80)
+							}
+							CatItem("Remember Session Choices")
 							{
 								Toggle("", isOn:$saveSessionSettings)
-									.frame(width:80)
+								.frame(width:80)
 							}
-							CatItem("Last Crash Log")
+						}
+						CatTitle("Diagnostics")
+						CatList()
+						{
+							CatItem("Connection Test (VPN, UDP, NAT, IPv6)")
 							{
-								Button(action: {
-									if let crash = CrashReporter.peek() {
-										UIPasteboard.general.string = crash
-										crashCopied = true
-									} else {
-										UIPasteboard.general.string = "(no crash recorded)"
-										crashCopied = true
-									}
-								}) {
-									Text(crashCopied ? "Copied!" : (CrashReporter.peek() == nil ? "None" : "Copy"))
-										.foregroundColor(CrashReporter.peek() == nil ? .gray : Color("AccentColor"))
+								Button("Run") { showConnectionTest = true }
+							}
+							CatItem("Keyboard Shortcut Probe (60 s)")
+							{
+								Button(keyProbeStarted ? "Running — press shortcuts" : "Start") {
+									GamepadController.startKeyboardProbe()
+									keyProbeStarted = true
 								}
 							}
-							CatItem("Diagnostics Log")
+							CatItem("Copy Diagnostics Log")
 							{
 								Button(action: {
-									if let diag = Diagnostics.peek() {
-										UIPasteboard.general.string = diag
-										diagCopied = true
-									} else {
-										UIPasteboard.general.string = "(no diagnostics recorded)"
-										diagCopied = true
-									}
+								if let diag = Diagnostics.peek() {
+								UIPasteboard.general.string = diag
+								diagCopied = true
+								} else {
+								UIPasteboard.general.string = "(no diagnostics recorded)"
+								diagCopied = true
+								}
 								}) {
-									Text(diagCopied ? "Copied!" : (Diagnostics.peek() == nil ? "None" : "Copy"))
-										.foregroundColor(Diagnostics.peek() == nil ? .gray : Color("AccentColor"))
+								Text(diagCopied ? "Copied!" : (!Diagnostics.hasLog ? "None" : "Copy"))
+								.foregroundColor(!Diagnostics.hasLog ? .gray : Color("AccentColor"))
+								}
+							}
+							CatItem("Copy Last Crash Log")
+							{
+								Button(action: {
+								if let crash = CrashReporter.peek() {
+								UIPasteboard.general.string = crash
+								crashCopied = true
+								} else {
+								UIPasteboard.general.string = "(no crash recorded)"
+								crashCopied = true
+								}
+								}) {
+								Text(crashCopied ? "Copied!" : (!CrashReporter.hasLog ? "None" : "Copy"))
+								.foregroundColor(!CrashReporter.hasLog ? .gray : Color("AccentColor"))
 								}
 							}
 						}
@@ -316,8 +351,33 @@ struct SettingsView:View
 			}
 		}
         .preferredColorScheme(appScheme)
+		.sheet(isPresented: $showConnectionTest) { ConnectionTestView() }
 		.scaleEffect(visible ? 1 : 0, anchor:.zero)
 		.animation(.easeInOut(duration:0.24))
+		.onChange(of: syncKeyboardLayout) { _ in
+			SettingsHandler.notifyChanged(.syncKeyboardLayout)
+		}
+		.onChange(of: layoutSyncHotkey) { _ in
+			SettingsHandler.notifyChanged(.layoutSyncHotkey)
+		}
+		.onChange(of: captureSystemKeys) { _ in
+			SettingsHandler.notifyChanged(.captureSystemKeys)
+		}
+		.onChange(of: hostShortcutToolbarMode) { _ in
+			SettingsHandler.notifyChanged(.hostShortcutToolbarMode)
+		}
+		.onChange(of: windowsKeyboardMode) { _ in
+			SettingsHandler.notifyChanged(.windowsKeyboardMode)
+		}
+		.onChange(of: preferredFramesPerSecond) { _ in
+			SettingsHandler.notifyChanged(.preferredFramesPerSecond)
+		}
+		.onChange(of: pointerPresentationMode) { _ in
+			SettingsHandler.notifyChanged(.pointerPresentationMode)
+		}
+		.onChange(of: bitrate) { _ in
+			SettingsHandler.notifyChanged(.bitrate)
+		}
 	}
 	
 	func saveAndExit()

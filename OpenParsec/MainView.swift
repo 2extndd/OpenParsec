@@ -1,8 +1,9 @@
 import SwiftUI
-import ParsecSDK
 
 struct MainView: View
 {
+	private static let uiTestPeerID = "openparsec-ui-test-peer"
+
 	var controller:ContentView?
 
 	@State private var page:Page = .hosts
@@ -22,11 +23,14 @@ struct MainView: View
 	// Global vars
 	@State var showBaseAlert: Bool = false
 	@State var baseAlertText: String = ""
+	@State private var returnToLoginAfterAlert = false
+	@State private var refreshTracker = ParsecRefreshTracker()
 
 	@State var showLogoutAlert: Bool = false
 
 	@State var isConnecting: Bool = false
 	@State var connectingToName: String = ""
+	@State private var lastConnectedPeerName: String = ""
 	@State var pollTimer: Timer?
 
 	@State var isRefreshing: Bool = false
@@ -169,6 +173,7 @@ struct MainView: View
 											}
 											.frame(maxWidth:100)
 										}
+										.accessibilityIdentifier(i.id == Self.uiTestPeerID ? "openparsec.fake-host.connect" : "openparsec.host.\(i.id).connect")
 									}
 
 									if i.connections > 0
@@ -289,7 +294,14 @@ struct MainView: View
 				.frame(maxWidth:.infinity)
 				.alert(isPresented:$showBaseAlert)
 				{
-					Alert(title: Text(baseAlertText))
+					Alert(
+						title: Text(baseAlertText),
+						dismissButton: .default(Text("OK")) {
+							guard returnToLoginAfterAlert else { return }
+							returnToLoginAfterAlert = false
+							logout()
+						}
+					)
 				}
 
 				// Page controls
@@ -366,6 +378,7 @@ struct MainView: View
 					.cornerRadius(8)
 					.padding()
 				}
+				.accessibilityIdentifier("openparsec.connection.pending")
 			}
 			if isRefreshing
 			{
@@ -388,37 +401,125 @@ struct MainView: View
 					.padding()
 				}
 			}
+
+			if OpenParsecRuntime.isUITesting {
+				SessionDiagnosticsAccessibilityView(exposesPhase: false)
+			}
 		}
 		.foregroundColor(Color("Foreground"))
 	}
 
 	func initView()
 	{
-		refreshHosts()
-		refreshSelf()
-		refreshFriends()
-
-		ParsecBackgroundManager.shared.onShouldReconnect = { peerId in			
-			if let host = hosts.first(where: { $0.id == peerId }) {
-				connectTo(host)
-			} else {
-				refreshHosts()
-			}
+		CParsec.configureMediaRecovery()
+		ParsecBackgroundManager.shared.onShouldReconnect = { request in
+			let displayName = lastConnectedPeerName.isEmpty
+				? "Previous host"
+				: lastConnectedPeerName
+			connectToPeerID(
+				request.peerID,
+				displayName: displayName,
+				intent: .reconnect
+			)
 		}
+
+		if OpenParsecRuntime.isUITesting {
+			switch OpenParsecRuntime.uiTestAPIFailure {
+			case "expired-auth":
+				presentAPIFailure(
+					ParsecAPIFailure(
+						endpoint: .hosts,
+						category: .sessionExpired,
+						statusCode: 401,
+						retryable: false,
+						requiresSignIn: true
+					)
+				)
+				return
+			case "missing-host":
+				hosts = []
+				hostCountStr = "0 hosts"
+				presentAPIFailure(
+					ParsecAPIFailure(
+						endpoint: .hosts,
+						category: .missingResource,
+						statusCode: 404,
+						retryable: false,
+						requiresSignIn: false
+					)
+				)
+				return
+			default:
+				break
+			}
+
+			hosts = [
+				IdentifiableHostInfo(
+					id: Self.uiTestPeerID,
+					hostname: "OpenParsec Fake Host",
+					user: UserInfo(id: 1, name: "OpenParsec Test", warp: false, team_id: "test"),
+					connections: 0
+				)
+			]
+			hostCountStr = "1 host"
+			refreshTime = "Deterministic test host"
+			return
+		}
+
+		refreshData()
 	}
 
-	func refreshHosts()
+	private func beginRefresh(requestCount: Int) -> UInt64 {
+		let generation = refreshTracker.begin(requestCount: requestCount)
+		isRefreshing = refreshTracker.isRefreshing
+		return generation
+	}
+
+	private func finishRefresh(generation: UInt64) {
+		guard refreshTracker.finish(generation: generation) else { return }
+		isRefreshing = refreshTracker.isRefreshing
+	}
+
+	private func presentAPIFailure(_ failure: ParsecAPIFailure) {
+		// An expired session takes precedence over lower-severity concurrent
+		// refresh failures and is resolved after the user acknowledges it.
+		if returnToLoginAfterAlert && !failure.requiresSignIn { return }
+		if failure.requiresSignIn {
+			NetworkHandler.clinfo = nil
+			returnToLoginAfterAlert = true
+		}
+		baseAlertText = failure.message
+		showBaseAlert = true
+	}
+
+	private func refreshData() {
+		let generation = beginRefresh(requestCount: 3)
+		refreshHosts(generation: generation)
+		refreshSelf(generation: generation)
+		refreshFriends(generation: generation)
+	}
+
+	func refreshHosts() {
+		let generation = beginRefresh(requestCount: 1)
+		refreshHosts(generation: generation)
+	}
+
+	private func refreshHosts(generation: UInt64)
 	{
 		withAnimation
 		{
-			isRefreshing = true
 
-			let clinfo = NetworkHandler.clinfo
-			if clinfo == nil
-			{
-				isRefreshing = false;
-				baseAlertText = "Error gathering hosts: Invalid session"
-				showBaseAlert = true
+			guard let clinfo = NetworkHandler.clinfo else {
+				presentAPIFailure(
+					ParsecAPIFailure(
+						endpoint: .hosts,
+						category: .sessionExpired,
+						statusCode: 401,
+						retryable: false,
+						requiresSignIn: true
+					)
+				)
+				finishRefresh(generation: generation)
 				return
 			}
 
@@ -427,20 +528,34 @@ struct MainView: View
 			var request = URLRequest(url:apiURL)
 			request.httpMethod = "GET"
 			request.setValue("application/json", forHTTPHeaderField:"Content-Type")
-			request.setValue("Bearer \(clinfo!.session_id)", forHTTPHeaderField:"Authorization")
+			request.setValue("Bearer \(clinfo.session_id)", forHTTPHeaderField:"Authorization")
 			request.setValue("parsec/150-93b Windows/11 libmatoya/4.0", forHTTPHeaderField: "User-Agent")
 
 			let task = URLSession.shared.dataTask(with:request)
 			{ (data, response, error) in
 				DispatchQueue.main.async {
+					guard refreshTracker.accepts(generation: generation) else { return }
+					defer { finishRefresh(generation: generation) }
 					if let data = data, let http = response as? HTTPURLResponse
 					{
 						let statusCode:Int = http.statusCode
 						let decoder = JSONDecoder()
+						let decoded = try? decoder.decode(HostInfoList.self, from: data)
+						if let failure = ParsecAPIResponseClassifier.classify(
+							endpoint: .hosts,
+							statusCode: statusCode,
+							transportFailed: error != nil,
+							decodedSuccessfully: decoded != nil
+						) {
+							hosts.removeAll()
+							hostCountStr = "Hosts unavailable"
+							presentAPIFailure(failure)
+							return
+						}
 
 						if statusCode == 200 // 200 OK
 						{
-							if let info = try? decoder.decode(HostInfoList.self, from:data)
+							if let info = decoded
 							{
 								hosts.removeAll()
 								if let datas = info.data
@@ -464,35 +579,38 @@ struct MainView: View
 								refreshTime = "Last refreshed at \(formatter.string(from:Date()))"
 							}
 						}
-						else if statusCode == 403 // 403 Forbidden
-						{
-							if let info = try? decoder.decode(ErrorInfo.self, from:data)
-							{
-								baseAlertText = "Error gathering hosts: \(info.error)"
-								showBaseAlert = true
-							}
-						}
 					}
-					else if error != nil
-					{
-						baseAlertText = "Network error gathering hosts. Check your connection and try again."
-						showBaseAlert = true
+					else if let failure = ParsecAPIResponseClassifier.classify(
+						endpoint: .hosts,
+						statusCode: nil,
+						transportFailed: true,
+						decodedSuccessfully: false
+					) {
+						hosts.removeAll()
+						hostCountStr = "Hosts unavailable"
+						presentAPIFailure(failure)
 					}
-
-					isRefreshing = false
 				}
 			}
 			task.resume()
 		}
 	}
 
-	func refreshSelf()
+	private func refreshSelf(generation: UInt64)
 	{
 		withAnimation
 		{
-			let clinfo = NetworkHandler.clinfo
-			if clinfo == nil
-			{
+			guard let clinfo = NetworkHandler.clinfo else {
+				presentAPIFailure(
+					ParsecAPIFailure(
+						endpoint: .currentUser,
+						category: .sessionExpired,
+						statusCode: 401,
+						retryable: false,
+						requiresSignIn: true
+					)
+				)
+				finishRefresh(generation: generation)
 				return
 			}
 
@@ -501,32 +619,46 @@ struct MainView: View
 			var request = URLRequest(url:apiURL)
 			request.httpMethod = "GET"
 			request.setValue("application/json", forHTTPHeaderField:"Content-Type")
-			request.setValue("Bearer \(clinfo!.session_id)", forHTTPHeaderField:"Authorization")
+			request.setValue("Bearer \(clinfo.session_id)", forHTTPHeaderField:"Authorization")
 			request.setValue("parsec/150-93b Windows/11 libmatoya/4.0", forHTTPHeaderField: "User-Agent")
 
 			let task = URLSession.shared.dataTask(with:request)
 			{ (data, response, error) in
 				DispatchQueue.main.async {
+					guard refreshTracker.accepts(generation: generation) else { return }
+					defer { finishRefresh(generation: generation) }
 					if let data = data, let http = response as? HTTPURLResponse
 					{
 						let statusCode:Int = http.statusCode
 						let decoder = JSONDecoder()
+						let decoded = try? decoder.decode(SelfInfo.self, from: data)
+						if let failure = ParsecAPIResponseClassifier.classify(
+							endpoint: .currentUser,
+							statusCode: statusCode,
+							transportFailed: error != nil,
+							decodedSuccessfully: decoded != nil
+						) {
+							userInfo = nil
+							presentAPIFailure(failure)
+							return
+						}
 
 						if statusCode == 200 // 200 OK
 						{
-							if let selfData = try? decoder.decode(SelfInfo.self, from:data).data
+							if let selfData = decoded?.data
 							{
 								userInfo = IdentifiableUserInfo(id:selfData.id, username:selfData.name)
 							}
 						}
-						else
-						{
-							if let info = try? decoder.decode(ErrorInfo.self, from:data)
-							{
-								baseAlertText = "Error gathering user info: \(info.error)"
-								showBaseAlert = true
-							}
-						}
+					}
+					else if let failure = ParsecAPIResponseClassifier.classify(
+						endpoint: .currentUser,
+						statusCode: nil,
+						transportFailed: true,
+						decodedSuccessfully: false
+					) {
+						userInfo = nil
+						presentAPIFailure(failure)
 					}
 				}
 			}
@@ -534,13 +666,21 @@ struct MainView: View
 		}
 	}
 
-	func refreshFriends()
+	private func refreshFriends(generation: UInt64)
 	{
 		withAnimation
 		{
-			let clinfo = NetworkHandler.clinfo
-			if clinfo == nil
-			{
+			guard let clinfo = NetworkHandler.clinfo else {
+				presentAPIFailure(
+					ParsecAPIFailure(
+						endpoint: .friends,
+						category: .sessionExpired,
+						statusCode: 401,
+						retryable: false,
+						requiresSignIn: true
+					)
+				)
+				finishRefresh(generation: generation)
 				return
 			}
 
@@ -549,20 +689,34 @@ struct MainView: View
 			var request = URLRequest(url:apiURL)
 			request.httpMethod = "GET"
 			request.setValue("application/json", forHTTPHeaderField:"Content-Type")
-			request.setValue("Bearer \(clinfo!.session_id)", forHTTPHeaderField:"Authorization")
+			request.setValue("Bearer \(clinfo.session_id)", forHTTPHeaderField:"Authorization")
 			request.setValue("parsec/150-93b Windows/11 libmatoya/4.0", forHTTPHeaderField: "User-Agent")
 
 			let task = URLSession.shared.dataTask(with:request)
 			{ (data, response, error) in
 				DispatchQueue.main.async {
+					guard refreshTracker.accepts(generation: generation) else { return }
+					defer { finishRefresh(generation: generation) }
 					if let data = data, let http = response as? HTTPURLResponse
 					{
 						let statusCode:Int = http.statusCode
 						let decoder = JSONDecoder()
+						let decoded = try? decoder.decode(FriendInfoList.self, from: data)
+						if let failure = ParsecAPIResponseClassifier.classify(
+							endpoint: .friends,
+							statusCode: statusCode,
+							transportFailed: error != nil,
+							decodedSuccessfully: decoded != nil
+						) {
+							friends.removeAll()
+							friendCountStr = "Friends unavailable"
+							presentAPIFailure(failure)
+							return
+						}
 
 						if statusCode == 200 // 200 OK
 						{
-							if let info = try? decoder.decode(FriendInfoList.self, from:data)
+							if let info = decoded
 							{
 								friends.removeAll()
 								if let datas = info.data
@@ -582,61 +736,63 @@ struct MainView: View
 								friendCountStr = "\(friends.count) \(grammar)"
 							}
 						}
-						else
-						{
-							if let info = try? decoder.decode(ErrorInfo.self, from:data)
-							{
-								baseAlertText = "Error gathering friends: \(info.error)"
-								showBaseAlert = true
-							}
-						}
 					}
-
-					isRefreshing = false
+					else if let failure = ParsecAPIResponseClassifier.classify(
+						endpoint: .friends,
+						statusCode: nil,
+						transportFailed: true,
+						decodedSuccessfully: false
+					) {
+						friends.removeAll()
+						friendCountStr = "Friends unavailable"
+						presentAPIFailure(failure)
+					}
 				}
 			}
 			task.resume()
 		}
 	}
 
-	func connectTo(_ who:IdentifiableHostInfo)
+	func connectTo(
+		_ who: IdentifiableHostInfo,
+		intent: ParsecConnectIntent = .initial
+	)
+	{
+		connectToPeerID(
+			who.id,
+			displayName: who.hostname,
+			intent: intent
+		)
+	}
+
+	private func connectToPeerID(
+		_ peerID: String,
+		displayName: String,
+		intent: ParsecConnectIntent
+	)
 	{
 		CParsec.initialize()
-		connectingToName = who.hostname
+		connectingToName = displayName
+		lastConnectedPeerName = displayName
 		withAnimation { isConnecting = true }
 
-		var status = CParsec.connect(who.id)
-
-		// Invalidate any in-flight poll timer before scheduling a new one. A
-		// background-reconnect (onShouldReconnect -> connectTo) or a rapid
-		// re-tap during the connecting phase can call connectTo while a prior
-		// timer is still live; without this the old repeating timer is orphaned
-		// and both fire, racing setView(.parsec)/showBaseAlert.
 		pollTimer?.invalidate()
-
-		// Polling status
-		pollTimer = Timer.scheduledTimer(withTimeInterval:1, repeats: true)
-		{ timer in
-			status = CParsec.getStatus()
-
-			if status == PARSEC_CONNECTING { return } // wait
-
+		pollTimer = nil
+		// The runner retries transient network failures (-6013 & co.) itself,
+		// so an alert here means the host is genuinely unreachable.
+		ParsecConnectRunner.shared.start(peerID: peerID, intent: intent) { status in
 			withAnimation { isConnecting = false }
-
-			if status == PARSEC_OK
-			{
-				if let c = controller
-				{
-					c.setView(.parsec)
-				}
+			if status == .ok {
+				controller?.setView(.parsec)
+				return
 			}
-			else
-			{
-				baseAlertText = "Error connecting to host (code \(status.rawValue))"
-				showBaseAlert = true
+			if intent == .reconnect {
+				// Terminal for this recovery episode: a later foreground must not
+				// schedule another generation behind the user's back.
+				ParsecBackgroundManager.shared.disableAutoReconnect()
 			}
-
-			timer.invalidate()
+			baseAlertText = ParsecStatusBar.failureMessage(forCode: Int(status.rawValue), connecting: true)
+			showBaseAlert = true
 		}
 	}
 
@@ -644,6 +800,8 @@ struct MainView: View
 	{
 		withAnimation { isConnecting = false }
 
+		ParsecConnectRunner.shared.cancel()
+		ParsecBackgroundManager.shared.disableAutoReconnect()
 		CParsec.disconnect()
 
 		// Q2: pollTimer is nil if Cancel is tapped before the connect poll

@@ -1,7 +1,13 @@
 import Foundation
+import OSLog
 import UIKit
-import ParsecSDK
+import GameController
 
+extension Notification.Name {
+	static let parsecPointerBehaviorDidChange = Notification.Name(
+		"ParsecPointerBehaviorDidChange"
+	)
+}
 
 protocol ParsecPlayground {
 	init(viewController: UIViewController, updateImage: @escaping () -> Void)
@@ -17,37 +23,50 @@ protocol ParsecPlayground {
 
 class ParsecViewController: UIViewController, UIScrollViewDelegate {
 	var glkView: ParsecPlayground!
+	private var renderSurfaceGeneration: UInt64 = 0
 	var gamePadController: GamepadController!
 	var touchController: TouchController!
 	var u: UIImageView?
-	// Locally-rendered iPadOS-style pointer dot that follows input immediately,
-	// skipping the host RTT that the host-streamed cursor (`u`) inherits.
-	// Visibility is toggled in updateImage based on
-	// SettingsHandler.localCursorOverlay.
+	// Locally-rendered pointer dot for captured relative mode. Native mode uses
+	// the unlocked iPadOS system pointer; touch-only fallback uses the host cursor.
 	var localCursorImageView: UIView?
 	var localCursorPosition: CGPoint = .zero
 	// viewDidLoad runs before the contentView has a non-zero size, so seeding
 	// the cursor there reads midX/Y as 0 and parks it at the corner. Re-seed
 	// once layout produces real bounds. One-shot via this flag.
 	var hasSeededLocalCursor: Bool = false
+	private var nativePointerActive = false
+	private var didInjectTestKeyboardKey = false
+	private var didExecuteTestMacShortcut = false
+	private var didExecuteTestWindowsShortcut = false
+	private var didExecuteTestGamepadInput = false
+	private var lastPublishedPointerDigest = ""
+	private let pointerLogger = Logger(
+		subsystem: "com.openparsec.client",
+		category: "pointer"
+	)
+	private(set) static var pointerBehaviorSnapshot = ParsecPointerBehavior(
+		mode: .native,
+		nativePointerActive: false
+	)
 	var lastImg: CGImage?
     var lastMouseX: Int32 = -1
     var lastMouseY: Int32 = -1
     var lastCursorHidden: Bool = false
+	var lastCursorScale = SettingsHandler.cursorScale
 	var isPinching = false
 	var zoomEnabled = false
-	var lastLongPressPoint : CGPoint = CGPoint()
-	var accumulatedDeltaX: Float = 0.0
-	var accumulatedDeltaY: Float = 0.0
+	var pointerDeltaAccumulator = ParsecDeltaAccumulator()
 	var lastPanLocation: CGPoint = .zero
 	var lastPanTranslation: CGPoint = .zero
 
-	// Trackpad / mouse-wheel scroll accumulators (separate from the touchscreen
-	// 2-finger pan path, which keeps using velocity-based wheel messages for
-	// direct-touch swipes).
-	var accumulatedScrollX: Float = 0.0
-	var accumulatedScrollY: Float = 0.0
+	// Trackpad momentum carries the same accumulator used by its live scroll.
+	// Direct-touch two-finger scrolling stays separate so overlapping gesture
+	// recognizers cannot consume each other's sub-pixel remainder.
+	var trackpadScrollAccumulator = ParsecDeltaAccumulator()
+	var touchScrollAccumulator = ParsecDeltaAccumulator()
 	var lastScrollTranslation: CGPoint = .zero
+	var lastTouchScrollTranslation: CGPoint = .zero
 
 	// Client-side scroll inertia. The trackpad scroll path is driven by a raw
 	// UIPanGestureRecognizer (allowedScrollTypesMask = .all, max 0 touches), NOT
@@ -67,21 +86,23 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 	var momentumDisplayLink: CADisplayLink?
 	var momentumVelocityX: Float = 0.0   // scaled host-wheel units / second
 	var momentumVelocityY: Float = 0.0
+	private var momentumElapsed: TimeInterval = 0
 	private var peakScrollVelocityX: CGFloat = 0   // raw points / second
 	private var peakScrollVelocityY: CGFloat = 0
+	private var trackpadScrollTravel: CGFloat = 0
 	// Glide tuning. Decay is expressed per-second and raised to dt each tick, so
 	// it is frame-rate independent. Start/stop are in scaled units/sec (same
 	// scale as momentumVelocity). These are deliberately conservative; the real
 	// feel can only be judged on-device, so they are easy to nudge.
 	private let scrollMomentumDecayPerSecond: Float = 0.02   // → ~2% of speed remains after 1 s
-	private let scrollMomentumStartSpeed: Float = 60.0       // below this a release doesn't glide
+	private var scrollLiveUnits = 0
+	private var scrollGlideUnits = 0
 	private let scrollMomentumStopSpeed: Float = 24.0        // below this the glide ends
 
 	// Layout sync — fires a hotkey at the host when the iPad's hardware-keyboard
 	// input language changes (e.g. Caps Lock toggle on Magic Keyboard).
 	var languageSync: LanguageSyncCoordinator?
 	
-	var mouseSensitivity: Float = Float(SettingsHandler.mouseSensitivity)
 	var activatedPanFingerNumber: Int = 0
 	
 	// Ctrl+Shift→Cmd+Space chord state machine (S05). `chordArmed` is true while
@@ -103,12 +124,19 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 	var keyboardAccessoriesView : UIView?
 	var keyboardHeight : CGFloat = 0.0
 	var keyboardVisible : Bool = false
+	private var keyboardWasVisibleBeforeResign = false
+	private var pendingSurfaceGeneration: UInt64?
 	var onKeyboardVisibilityChanged: ((Bool) -> Void)?
 	var scrollView: UIScrollView!
 	var contentView: UIView!
 
+	// True while an in-session overlay (Settings) needs the local pointer:
+	// unlocks the pointer and stops captured GCMouse input reaching the host.
+	// Static because GCMouse handlers read it on GameController's queue.
+	static var sessionOverlayActive = false
+
 	override var prefersPointerLocked: Bool {
-		return true
+		pointerBehavior.prefersPointerLocked && !Self.sessionOverlayActive
 	}
 	
 	override var prefersHomeIndicatorAutoHidden : Bool {
@@ -122,14 +150,24 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 	// Parsec, because the pointer lock is unique to this screen. Deferring the system
 	// edge gestures hands that strip back to the app. A second deliberate swipe still
 	// reaches the system gesture, so Control-Center access is preserved.
+	// Deferred for the whole session (not only when locked): the first swipe or
+	// pointer push at an edge goes to the host instead of popping the iPad Dock;
+	// a second deliberate one still reaches the system. Released while an
+	// in-session overlay (Settings) is open.
 	override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge {
-		return .all
+		Self.sessionOverlayActive ? [] : .all
 	}
+
+	// Live controller count in diagnostics proves on device that leaving a
+	// session frees it (a leak kept N render loops alive).
+	private static var liveCount = 0
 
 	init() {
 		super.init(nibName: nil, bundle: nil)
+		Self.liveCount += 1
+		Diagnostics.note("session-vc event=init live=\(Self.liveCount)")
 
-		self.glkView = ParsecGLKViewController(viewController: self, updateImage: updateImage)
+		self.glkView = ParsecGLKViewController(viewController: self, updateImage: { [weak self] in self?.updateImage() })
 
 		self.gamePadController = GamepadController(viewController: self)
 		self.touchController = TouchController(viewController: self)
@@ -140,8 +178,36 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 	}
 
 	deinit {
+		Self.liveCount -= 1
+		Diagnostics.note("session-vc event=deinit live=\(Self.liveCount)")
 		languageSync?.stop()
 		stopScrollMomentum()
+	}
+
+	private var pointerBehavior: ParsecPointerBehavior {
+		ParsecPointerBehavior(
+			mode: SettingsHandler.pointerPresentationMode,
+			nativePointerActive: nativePointerActive
+		)
+	}
+
+	private func applyPointerBehavior(hostCursorHidden: Bool? = nil) {
+		let behavior = pointerBehavior
+		localCursorImageView?.isHidden = !behavior.showsLocalCursor
+		if behavior.showsHostCursor {
+			u?.isHidden = hostCursorHidden ?? CParsec.mouseInfo.cursorHidden
+		} else {
+			u?.isHidden = true
+		}
+
+		guard behavior.digest != lastPublishedPointerDigest else { return }
+		lastPublishedPointerDigest = behavior.digest
+		Self.pointerBehaviorSnapshot = behavior
+		pointerLogger.info("pointer \(behavior.digest, privacy: .public)")
+		NotificationCenter.default.post(
+			name: .parsecPointerBehaviorDidChange,
+			object: behavior
+		)
 	}
 
 	func updateImage() {
@@ -155,28 +221,23 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
         let currentHidden = info.cursorHidden
         let currentImg = info.cursorImg
 
-        // Toggle host vs local cursor visibility from the same place so they
-        // stay mutually exclusive without scattered if-statements.
-        let useLocalOverlay = SettingsHandler.localCursorOverlay
-        localCursorImageView?.isHidden = !useLocalOverlay
-        if useLocalOverlay {
-            // Suppress the host-rendered cursor image — we're drawing our
-            // own. Early-return to skip the position math below since `u`
-            // isn't being displayed.
-            u?.isHidden = true
-            return
-        } else {
-            u?.isHidden = false
-        }
+        // The presentation policy owns cursor visibility. Native hover uses
+        // the immediate iPadOS system pointer, captured mode uses the local
+        // overlay, and touch-only native sessions retain the host fallback.
+        applyPointerBehavior(hostCursorHidden: currentHidden)
+        guard pointerBehavior.showsHostCursor else { return }
 
         // Skip if nothing changed
         if currentMouseX == lastMouseX &&
            currentMouseY == lastMouseY &&
            currentHidden == lastCursorHidden &&
-           currentImg == lastImg {
+           currentImg == lastImg &&
+           SettingsHandler.cursorScale == lastCursorScale {
             return
         }
         
+        // Cursor Size changes must resize a stationary cursor too.
+        lastCursorScale = SettingsHandler.cursorScale
         lastMouseX = currentMouseX
         lastMouseY = currentMouseY
         lastCursorHidden = currentHidden
@@ -266,6 +327,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 	}
 	
 	override func viewDidLoad() {
+		Self.sessionOverlayActive = false
 		// ScrollView Setup
 		scrollView = UIScrollView(frame: view.bounds)
 		scrollView.delegate = self
@@ -299,7 +361,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 			// Assumption: glkView.viewDidLoad() adds a subview.
 		}
 
-		if #available(iOS 15.0, *) {
+		if #available(iOS 15.0, *), !OpenParsecRuntime.disablesPiP {
 			if let parsecGLK = glkView as? ParsecGLKViewController,
 			   let eaglContext = parsecGLK.eaglContext {
 				PictureInPictureManager.shared.setup(sourceView: view, glContext: eaglContext, glkViewController: parsecGLK.glkViewController)
@@ -329,7 +391,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		localCursor.layer.shadowRadius = 2.5
 		localCursor.layer.shadowOffset = CGSize(width: 0, height: 1)
 		localCursor.isUserInteractionEnabled = false
-		localCursor.isHidden = !SettingsHandler.localCursorOverlay
+		localCursor.isHidden = !pointerBehavior.showsLocalCursor
 		contentView.addSubview(localCursor)
 		localCursorImageView = localCursor
 		// The real seeding happens in viewDidLayoutSubviews — contentView's
@@ -359,6 +421,28 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 			NSNumber(value: UITouch.TouchType.pencil.rawValue)
 		]
 		view.addGestureRecognizer(panGestureRecognizer)
+
+		let hoverGestureRecognizer = UIHoverGestureRecognizer(
+			target: self,
+			action: #selector(handlePointerHover(_:))
+		)
+		view.addGestureRecognizer(hoverGestureRecognizer)
+
+		// Hover intentionally describes pointer movement with no click. Magic
+		// Keyboard click-drag needs a separate indirect-pointer pan route while
+		// Native presentation remains unlocked.
+		let nativeDragRecognizer = UIPanGestureRecognizer(
+			target: self,
+			action: #selector(handleNativePointerDrag(_:))
+		)
+		nativeDragRecognizer.allowedTouchTypes = [
+			NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
+		]
+		nativeDragRecognizer.minimumNumberOfTouches = 1
+		nativeDragRecognizer.maximumNumberOfTouches = 1
+		nativeDragRecognizer.cancelsTouchesInView = false
+		nativeDragRecognizer.delegate = self
+		view.addGestureRecognizer(nativeDragRecognizer)
 
 		// Dedicated recognizer for trackpad / mouse-wheel scroll events
 		// (iPadOS 13.4+, available unconditionally at deployment target 14).
@@ -397,6 +481,13 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		let longPressGestureRecognizer = UILongPressGestureRecognizer(target: self, action:#selector(handleLongPress(_:)))
 		longPressGestureRecognizer.numberOfTouchesRequired = 1
 		longPressGestureRecognizer.allowedTouchTypes = [0, 2]
+		longPressGestureRecognizer.minimumPressDuration = ParsecTouchInteractionPolicy.dragMinimumPressDuration
+		longPressGestureRecognizer.allowableMovement = ParsecTouchInteractionPolicy.dragAllowableMovement
+		longPressGestureRecognizer.delegate = self
+		// A successful drag owns the contact. Delay the one-finger tap until the
+		// short-hold recognizer fails so one physical hold cannot emit drag and
+		// then an extra click.
+		singleFingerTapGestureRecognizer.require(toFail: longPressGestureRecognizer)
 		view.addGestureRecognizer(longPressGestureRecognizer)
 		
 		NotificationCenter.default.addObserver(
@@ -415,11 +506,66 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 
 		NotificationCenter.default.addObserver(
 			self,
-			selector: #selector(appWillEnterForeground),
-			name: UIApplication.willEnterForegroundNotification,
+			selector: #selector(appWillResignActive),
+			name: UIApplication.willResignActiveNotification,
+			object: nil
+		)
+		NotificationCenter.default.addObserver(
+			self,
+			selector: #selector(appDidBecomeActive),
+			name: UIApplication.didBecomeActiveNotification,
+			object: nil
+		)
+		NotificationCenter.default.addObserver(
+			self,
+			selector: #selector(settingDidChange),
+			name: .parsecSettingDidChange,
 			object: nil
 		)
 
+	}
+
+	func replaceRenderSurfaceForReconnect(generation: UInt64) {
+		dispatchPrecondition(condition: .onQueue(.main))
+		guard isViewLoaded, contentView != nil else { return }
+		// Creating a GL surface in the background gets the app killed; defer
+		// to appDidBecomeActive.
+		guard UIApplication.shared.applicationState != .background else {
+			pendingSurfaceGeneration = generation
+			return
+		}
+		pendingSurfaceGeneration = nil
+		guard renderSurfaceGeneration != generation else {
+			glkView?.resume()
+			return
+		}
+		renderSurfaceGeneration = generation
+
+		(glkView as? ParsecGLKViewController)?.detach()
+		let replacement = ParsecGLKViewController(
+			viewController: self,
+			updateImage: { [weak self] in self?.updateImage() }
+		)
+		glkView = replacement
+		replacement.viewDidLoad()
+		replacement.glkView.removeFromSuperview()
+		replacement.glkView.frame = contentView.bounds
+		contentView.addSubview(replacement.glkView)
+		replacement.updateSize(
+			width: contentView.bounds.width,
+			height: contentView.bounds.height
+		)
+		replacement.resume()
+		Diagnostics.note(
+			"render-surface event=replaced generation=\(generation) " +
+			"width=\(Int(contentView.bounds.width)) " +
+			"height=\(Int(contentView.bounds.height))"
+		)
+	}
+
+	func synchronizeRenderDimensions() {
+		dispatchPrecondition(condition: .onQueue(.main))
+		(glkView as? ParsecGLKViewController)?.synchronizeDimensions()
 	}
 	
 	override func viewDidLayoutSubviews() {
@@ -436,30 +582,71 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 
 	override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
 		super.viewWillTransition(to: size, with: coordinator)
-		
-		let h = size.height
-		let w = size.width
-		
-		// Reset zoom on rotation
-		scrollView.zoomScale = 1.0
+		glkView?.cleanUp()
 
-		self.glkView.updateSize(width: w, height: h)
-		contentView.frame.size = CGSize(width: w, height: h)
-		scrollView.contentSize = CGSize(width: w, height: h)
-		CParsec.setFrame(w, h, UIScreen.main.scale)
-        
-        // Reset accessory view to ensure correct width in new orientation
-        keyboardAccessoriesView = nil
-        if keyboardVisible {
-            reloadInputViews()
-        }
+		coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+			guard let self,
+			      UIApplication.shared.applicationState == .active else { return }
+			let settledSize = self.view.bounds.size
+			guard settledSize.width > 0, settledSize.height > 0 else { return }
+
+			self.scrollView.zoomScale = 1.0
+			self.glkView.updateSize(
+				width: settledSize.width,
+				height: settledSize.height
+			)
+			self.contentView.frame.size = settledSize
+			self.scrollView.contentSize = settledSize
+			self.glkView.resume()
+			self.synchronizeRenderDimensions()
+
+			// Reset accessory view to ensure correct width in new orientation.
+			self.keyboardAccessoriesView = nil
+			if self.keyboardVisible {
+				self.reloadInputViews()
+			}
+		}
 	}
 	
 	override func viewDidAppear(_ animated: Bool) {
 		super.viewDidAppear(animated)
+		nativePointerActive = false
+		applyPointerBehavior()
 		if let parent = parent {
 			parent.setChildForHomeIndicatorAutoHidden(self)
 			parent.setChildViewControllerForPointerLock(self)
+			parent.setChildForScreenEdgesDeferringSystemGestures(self)
+		}
+		if OpenParsecRuntime.holdsTestKeyboardKey,
+		   !didInjectTestKeyboardKey {
+			didInjectTestKeyboardKey = true
+			CParsec.sendKeyboardMessage(
+				event: KeyBoardKeyEvent(
+					key: RemoteKeyCode(rawValue: 4),
+					isPressBegin: true
+				)
+			)
+		}
+		if OpenParsecRuntime.executesTestMacShortcut,
+		   !didExecuteTestMacShortcut {
+			didExecuteTestMacShortcut = true
+			CParsec.sendMacShortcut(.appSwitcher)
+		}
+		if OpenParsecRuntime.executesTestWindowsShortcut,
+		   !didExecuteTestWindowsShortcut {
+			didExecuteTestWindowsShortcut = true
+			CParsec.sendWindowsShortcut(.startMenu)
+		}
+		if OpenParsecRuntime.executesTestGamepadInput,
+		   !didExecuteTestGamepadInput {
+			didExecuteTestGamepadInput = true
+			// Press a supported button and an unsupported one, deflect a
+			// stick, then release everything through the production path so
+			// the UI test can prove no host button/axis is left stuck.
+			CParsec.sendGameControllerButtonMessage(controllerId: 1, .a, pressed: true)
+			CParsec.sendGameControllerButtonMessage(controllerId: 1, .guide, pressed: true)
+			CParsec.sendGameControllerAxisMessage(controllerId: 1, .leftX, 900)
+			CParsec.releaseAllGamepadInputs(reason: .normal)
 		}
 		if keyboardVisible {
 			becomeFirstResponder()
@@ -472,18 +659,123 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		glkView?.resume()
 	}
 
-	@objc private func appWillEnterForeground() {
-		// Background→foreground invalidates GL drawable currency; re-current
-		// the context and unpause so the next frame renders instead of going
-		// black. Scene plumbing doesn't reach this VC, so observe directly.
-		glkView?.resume()
+	@objc private func appWillResignActive() {
+		// Stop the display link before UIKit applies transient scene transforms.
+		// Otherwise GLK autoresizing can publish portrait/ultrawide dimensions
+		// to the SDK while the app is leaving the foreground.
+		glkView?.cleanUp()
+		// keyboardWillHide fires while backgrounding; remember the user's choice.
+		keyboardWasVisibleBeforeResign = keyboardVisible
+	}
+
+	@objc private func appDidBecomeActive() {
+		// App-switch gestures can leave UIScrollView's pinch/offset in an
+		// intermediate zoom. At zoom > 1, scroll is intentionally consumed
+		// locally instead of reaching the host, which looks like dead input.
+		resetForegroundInteractionViewport()
+		DispatchQueue.main.async { [weak self] in
+			guard let self else { return }
+			if let generation = self.pendingSurfaceGeneration {
+				self.replaceRenderSurfaceForReconnect(generation: generation)
+			}
+			if self.keyboardWasVisibleBeforeResign && !self.keyboardVisible {
+				self.setKeyboardVisible(true)
+			}
+			self.setNeedsUpdateOfPrefersPointerLocked()
+			self.view.layoutIfNeeded()
+			let settledSize = self.contentView.bounds.size
+			guard settledSize.width > 0, settledSize.height > 0 else { return }
+			self.glkView.updateSize(
+				width: settledSize.width,
+				height: settledSize.height
+			)
+			self.glkView.resume()
+			self.synchronizeRenderDimensions()
+		}
+	}
+
+	@objc private func settingDidChange(_ notification: Notification) {
+		guard let change = notification.object as? ParsecSettingChange else { return }
+
+		switch change.id {
+		case .syncKeyboardLayout:
+			// The hidden field always runs (it holds first responder); the
+			// coordinator's closure reads the setting on each change.
+			break
+		case .layoutSyncHotkey:
+			// The coordinator reads the selected hotkey when the next distinct
+			// input-mode change arrives, so no restart is required.
+			break
+		case .hostShortcutToolbarMode:
+			keyboardAccessoriesView = nil
+			if keyboardVisible {
+				reloadInputViews()
+			}
+		case .windowsKeyboardMode:
+			// Release physical keys through the adapter mapping latch before
+			// clearing local bookkeeping so press and release stay paired.
+			CParsec.releaseAllKeyboardKeys(reason: .settingsChanged)
+			resetKeyboardBookkeeping()
+		case .captureSystemKeys:
+			// keyCommands is queried for each event and reads the canonical
+			// setting live; receiving the change confirms the active controller.
+			break
+		case .preferredFramesPerSecond:
+			(glkView as? ParsecGLKViewController)?.applyPreferredFrameRate()
+		case .pointerPresentationMode:
+			// Switching owner mid-hold must not strand a button on the host.
+			CParsec.releaseAllMouseButtons(reason: .gestureCancelled)
+			// Pointer lock is only re-queried when asked to.
+			setNeedsUpdateOfPrefersPointerLocked()
+			setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
+		case .bitrate:
+			// 0 = host default: keep the current stream rate.
+			// 0 = host default; an equal value was already pushed by the
+			// session menu, so skip a second encoder reconfigure.
+			guard SettingsHandler.bitrate > 0,
+				  DataManager.model.bitrate != SettingsHandler.bitrate else { return }
+			DataManager.model.bitrate = SettingsHandler.bitrate
+			CParsec.updateHostVideoConfig()
+		default:
+			return
+		}
+
+		Diagnostics.note(
+			"setting-apply id=\(change.id.rawValue) mode=live result=applied"
+		)
+	}
+
+	private func resetForegroundInteractionViewport() {
+		let previousZoom = scrollView.zoomScale
+		let previousOffset = scrollView.contentOffset
+		stopScrollMomentum()
+		lastScrollTranslation = .zero
+		lastTouchScrollTranslation = .zero
+		trackpadScrollAccumulator.reset()
+		touchScrollAccumulator.reset()
+		pointerDeltaAccumulator.reset()
+		scrollView.layer.removeAllAnimations()
+		scrollView.setZoomScale(1.0, animated: false)
+		scrollView.setContentOffset(.zero, animated: false)
+		Diagnostics.note(
+			"foreground-viewport zoomBefore=\(String(format: "%.2f", previousZoom)) "
+			+ "offsetBefore=\(Int(previousOffset.x)),\(Int(previousOffset.y)) "
+			+ "zoomAfter=\(String(format: "%.2f", scrollView.zoomScale))"
+		)
 	}
 	
 	override func viewWillDisappear(_ animated: Bool) {
 		super.viewWillDisappear(animated)
+		CParsec.releaseAllMouseButtons(reason: .viewDisappeared)
+		CParsec.releaseAllKeyboardKeys(reason: .viewDisappeared)
+		CParsec.releaseAllGamepadInputs(reason: .viewDisappeared)
+		resetKeyboardBookkeeping()
+		nativePointerActive = false
+		applyPointerBehavior()
 		if let parent = parent {
 			parent.setChildForHomeIndicatorAutoHidden(nil)
 			parent.setChildViewControllerForPointerLock(nil)
+			parent.setChildForScreenEdgesDeferringSystemGestures(nil)
 		}
 		NotificationCenter.default.removeObserver(self, name: UIResponder.keyboardWillShowNotification, object: nil)
 		NotificationCenter.default.removeObserver(self, name: UIResponder.keyboardWillHideNotification, object: nil)
@@ -492,6 +784,50 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 	}
 	
 	
+	@objc private func handlePointerHover(_ recognizer: UIHoverGestureRecognizer) {
+		let route = pointerBehavior.inputRoute
+
+		switch recognizer.state {
+		case .began, .changed:
+			guard ParsecPointerMotionOwnership.usesHover(
+				route: route,
+				pressedButtonCount: CParsec.mouseInputSnapshot.pressedCount
+			) else {
+				return
+			}
+			if !nativePointerActive {
+				nativePointerActive = true
+				applyPointerBehavior()
+			}
+			sendNativePointerPosition(recognizer.location(in: view))
+		case .ended, .cancelled, .failed:
+			nativePointerActive = false
+			applyPointerBehavior()
+		default:
+			break
+		}
+	}
+
+	private func sendNativePointerPosition(_ positionInView: CGPoint) {
+		let position = contentView.convert(positionInView, from: view)
+		let x = max(0, min(position.x, contentView.bounds.width))
+		let y = max(0, min(position.y, contentView.bounds.height))
+		CParsec.sendMousePosition(Int32(x), Int32(y))
+	}
+
+	@objc private func handleNativePointerDrag(_ recognizer: UIPanGestureRecognizer) {
+		guard ParsecPointerMotionOwnership.usesNativeDragPan(
+			route: pointerBehavior.inputRoute,
+			pressedButtonCount: CParsec.mouseInputSnapshot.pressedCount
+		) else {
+			return
+		}
+		guard recognizer.state == .began || recognizer.state == .changed else {
+			return
+		}
+		sendNativePointerPosition(recognizer.location(in: view))
+	}
+
 	// Direct trackpad pointer handling (issue #47). With prefersPointerLocked = true,
 	// iPadOS delivers Magic Keyboard trackpad motion as UITouches with
 	// type == .indirectPointer. Routing those through a UIPanGestureRecognizer
@@ -500,74 +836,66 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 	//
 	// The main pan recognizer's allowedTouchTypes excludes .indirectPointer
 	// (see viewDidLoad), so those touches reach this override unobstructed.
+	private func syncIndirectPointerButtons(
+		buttonMask: UIEvent.ButtonMask,
+		releaseReason: ParsecMouseReleaseReason = .normal
+	) {
+		let buttons = ParsecPointerButtonMaskSnapshot(buttonMask: buttonMask)
+		CParsec.sendMouseClickMessage(
+			.left,
+			buttons.primaryPressed,
+			releaseReason: releaseReason
+		)
+		CParsec.sendMouseClickMessage(
+			.right,
+			buttons.secondaryPressed,
+			releaseReason: releaseReason
+		)
+	}
+
 	override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
 		super.touchesBegan(touches, with: event)
-		// Reset the trackpad-cursor delta accumulators when an .indirectPointer
-		// touch begins so a new stroke doesn't inherit leftover sub-pixel motion.
-		for touch in touches where touch.type == .indirectPointer {
-			accumulatedDeltaX = 0.0
-			accumulatedDeltaY = 0.0
+		let hasIndirectPointer = touches.contains { $0.type == .indirectPointer }
+		if hasIndirectPointer, let event {
+			syncIndirectPointerButtons(buttonMask: event.buttonMask)
 		}
 	}
 
+	// Indirect touches only sync buttons. Motion is owned elsewhere: absolute
+	// drag by handleNativePointerDrag, captured (relative) motion solely by
+	// GCMouse.mouseMovedHandler — sending deltas here too doubled drags.
 	override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
 		super.touchesMoved(touches, with: event)
-		for touch in touches where touch.type == .indirectPointer {
-			if SettingsHandler.cursorMode == .direct {
-				let pos = touch.preciseLocation(in: view)
-				let adjusted = contentView.convert(pos, from: view)
-				CParsec.sendMousePosition(Int32(adjusted.x), Int32(adjusted.y))
-				moveLocalCursor(to: adjusted)
-			} else {
-				// Iterate coalesced samples so fast trackpad motion is sent at
-				// the hardware sample rate (up to 120 Hz) rather than being
-				// sub-sampled to the slower UIKit event rate. Each sample's
-				// precisePreviousLocation chains to the prior sample, so summing
-				// per-sample deltas reconstructs the full path — the cursor
-				// tracks fast flicks smoothly instead of jumping in big steps.
-				let samples = event?.coalescedTouches(for: touch) ?? [touch]
-				for sample in samples {
-					let prev = sample.precisePreviousLocation(in: view)
-					let cur = sample.preciseLocation(in: view)
-					let rawDX = cur.x - prev.x
-					let rawDY = cur.y - prev.y
-					let scale = effectiveDeltaScale(rawDX: rawDX, rawDY: rawDY)
-					let preciseDX = rawDX * scale
-					let preciseDY = rawDY * scale
-
-					// Move the LOCAL cursor at full sub-pixel precision so it
-					// glides smoothly even when the rounded host-delta is zero.
-					moveLocalCursor(byX: preciseDX, y: preciseDY)
-
-					accumulatedDeltaX += Float(preciseDX)
-					accumulatedDeltaY += Float(preciseDY)
-					// Round-half-away-from-zero (not Int32 truncation) so that
-					// sub-pixel ticks like 0.4 still emit a 1-pixel send to host.
-					let dx = Int32(accumulatedDeltaX.rounded(.toNearestOrAwayFromZero))
-					let dy = Int32(accumulatedDeltaY.rounded(.toNearestOrAwayFromZero))
-					if dx != 0 || dy != 0 {
-						CParsec.sendMouseDelta(dx, dy)
-						accumulatedDeltaX -= Float(dx)
-						accumulatedDeltaY -= Float(dy)
-					}
-				}
-			}
+		let hasIndirectPointer = touches.contains { $0.type == .indirectPointer }
+		if hasIndirectPointer, let event {
+			syncIndirectPointerButtons(buttonMask: event.buttonMask)
 		}
 	}
 
-	// Combined sensitivity × acceleration. Acceleration adds a per-event
-	// gain proportional to the per-event speed: bigger movements travel
-	// proportionally further, mimicking macOS pointer acceleration. Falls
-	// back to pure linear sensitivity when mouseAcceleration == 0.
-	private func effectiveDeltaScale(rawDX: CGFloat, rawDY: CGFloat) -> CGFloat {
-		let sens = CGFloat(SettingsHandler.mouseSensitivity)
-		let accel = CGFloat(SettingsHandler.mouseAcceleration)
-		guard accel > 0 else { return sens }
-		// |raw_delta| is in points per input event (typically 0..15).
-		// Dividing by 5 normalizes so 5 px/event ≈ 1× boost at accel=1.
-		let speed = sqrt(rawDX * rawDX + rawDY * rawDY) / 5.0
-		return sens + accel * speed
+	override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+		super.touchesEnded(touches, with: event)
+		let indirectTouches = touches.filter { $0.type == .indirectPointer }
+		guard !indirectTouches.isEmpty else { return }
+
+		if pointerBehavior.inputRoute == .absolute,
+		   CParsec.mouseInputSnapshot.pressedCount > 0,
+		   let finalTouch = indirectTouches.first {
+			sendNativePointerPosition(finalTouch.preciseLocation(in: view))
+		}
+		syncIndirectPointerButtons(buttonMask: [])
+		pointerDeltaAccumulator.reset()
 	}
+
+	override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+		super.touchesCancelled(touches, with: event)
+		guard touches.contains(where: { $0.type == .indirectPointer }) else { return }
+		syncIndirectPointerButtons(
+			buttonMask: [],
+			releaseReason: .gestureCancelled
+		)
+		pointerDeltaAccumulator.reset()
+	}
+
 
 	// Move the local cursor overlay (no-op if it's hidden — we just keep
 	// the tracker fresh so toggling the setting mid-session lands on a
@@ -583,6 +911,10 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		clampAndApplyLocalCursor()
 	}
 
+	var shouldForwardRemoteScroll: Bool {
+		(scrollView?.zoomScale ?? 1.0) <= 1.0
+	}
+
 	private func clampAndApplyLocalCursor() {
 		let bounds = contentView.bounds
 		localCursorPosition.x = max(0, min(localCursorPosition.x, bounds.width))
@@ -590,64 +922,90 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		localCursorImageView?.center = localCursorPosition
 	}
 
-	// Cleared sub-pixel residue so the next gesture starts from zero. Without
-	// this the residue carries across strokes at low sensitivity and creates
-	// systematic drift.
-	override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-		super.touchesEnded(touches, with: event)
-		for touch in touches where touch.type == .indirectPointer {
-			accumulatedDeltaX = 0.0
-			accumulatedDeltaY = 0.0
-			break
+	private func resetKeyboardBookkeeping() {
+		heldModifierKeyCodes.removeAll()
+		suppressedKeyUps.removeAll()
+		chordArmed = false
+		chordSawOtherKey = false
+		resetKeyboardAccessoryToggles(in: keyboardAccessoriesView)
+	}
+
+	private func resetKeyboardAccessoryToggles(in view: UIView?) {
+		guard let view else { return }
+		if let button = view as? KeyboardButton, button.isToggleable {
+			button.isOn = false
+			button.backgroundColor = .black
+		}
+		for subview in view.subviews {
+			resetKeyboardAccessoryToggles(in: subview)
 		}
 	}
 
-	override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-		super.touchesCancelled(touches, with: event)
-		for touch in touches where touch.type == .indirectPointer {
-			accumulatedDeltaX = 0.0
-			accumulatedDeltaY = 0.0
-			break
-		}
+	private func remoteKeyEvent(_ usage: UIKeyboardHIDUsage?, pressed: Bool) -> KeyBoardKeyEvent? {
+		guard let usage else { return nil }
+		return KeyBoardKeyEvent(
+			key: RemoteKeyCode(
+				rawValue: UInt32(KeyCodeTranslators.uiKeyCodeToInt(key: usage))
+			),
+			isPressBegin: pressed
+		)
 	}
 
 	override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-
 		for press in presses {
-			chordTrackPressBegan(press.key)
-			// Backtick→Cmd+Space remap: a bare ` becomes a manual language switch.
-			// Swallow the grave key-down and synthesize Cmd+Space at the host;
-			// record the suppression so the matching key-up is swallowed too.
-			if backtickWillEmulateCmdSpace(press.key), let usage = press.key?.keyCode {
-				// Auto-repeat delivers repeated pressesBegan with no intervening
-				// key-up; fire Cmd+Space only on the first down so holding ` does
-				// not spam input-source switches at the host.
-				if suppressedKeyUps.insert(usage).inserted {
-					fireCmdSpace()
-				}
-				continue
-			}
-			// Always forward the raw scancode unchanged — the Cmd+Space emulation
-			// is additive and fires only on a clean Ctrl+Shift release, so host
-			// shortcuts like Ctrl+Shift+X keep working.
-			CParsec.sendKeyboardMessage(event:KeyBoardKeyEvent(input: press.key, isPressBegin: true) )
+			guard let key = press.key else { continue }
+			hardwareKeyBegan(key.keyCode, modifiers: key.modifierFlags)
 		}
-
 	}
 
 	override func pressesEnded (_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-
 		for press in presses {
-			// If we swallowed this key's key-down (backtick→Cmd+Space), swallow the
-			// key-up too — the host already saw a complete Cmd+Space tap.
-			if let usage = press.key?.keyCode, suppressedKeyUps.remove(usage) != nil {
-				chordTrackPressEnded(press.key)
-				continue
-			}
-			CParsec.sendKeyboardMessage(event:KeyBoardKeyEvent(input: press.key, isPressBegin: false) )
-			chordTrackPressEnded(press.key)
+			guard let key = press.key else { continue }
+			hardwareKeyEnded(key.keyCode)
 		}
+	}
 
+	// UIKey has no public initializer, so the per-key logic takes the HID
+	// usage + modifier flags; tests drive the ` and ⌃⇧ macros through these.
+	func hardwareKeyBegan(_ usage: UIKeyboardHIDUsage, modifiers: UIKeyModifierFlags) {
+		// Shortcut matrix evidence: which modifier chords iPadOS delivers.
+		// Only usage codes of chords are logged, never typed text.
+		// Modifier keys themselves (usage >= 224) are noise here.
+		if usage.rawValue < 224, !modifiers.intersection([.command, .control, .alternate]).isEmpty {
+			Diagnostics.note("key-chord via=uikit usage=\(usage.rawValue) mods=\(modifiers.rawValue)")
+		}
+		chordTrackPressBegan(usage)
+		// Backtick→Cmd+Space remap: a bare ` becomes a manual language switch.
+		// Swallow the grave key-down and synthesize Cmd+Space at the host;
+		// record the suppression so the matching key-up is swallowed too.
+		if backtickWillEmulateCmdSpace(usage, modifiers: modifiers) {
+			// Auto-repeat delivers repeated pressesBegan with no intervening
+			// key-up; fire Cmd+Space only on the first down so holding ` does
+			// not spam input-source switches at the host.
+			if suppressedKeyUps.insert(usage).inserted {
+				fireCmdSpace(source: "backtick")
+			}
+			return
+		}
+		// Always forward the raw scancode unchanged — the Cmd+Space emulation
+		// is additive and fires only on a clean Ctrl+Shift release, so host
+		// shortcuts like Ctrl+Shift+X keep working.
+		if let keyEvent = remoteKeyEvent(usage, pressed: true) {
+			CParsec.sendKeyboardMessage(event: keyEvent)
+		}
+	}
+
+	func hardwareKeyEnded(_ usage: UIKeyboardHIDUsage) {
+		// If we swallowed this key's key-down (backtick→Cmd+Space), swallow the
+		// key-up too — the host already saw a complete Cmd+Space tap.
+		if suppressedKeyUps.remove(usage) != nil {
+			chordTrackPressEnded(usage)
+			return
+		}
+		if let keyEvent = remoteKeyEvent(usage, pressed: false) {
+			CParsec.sendKeyboardMessage(event: keyEvent)
+		}
+		chordTrackPressEnded(usage)
 	}
 
 	override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -656,11 +1014,16 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		// lost — both for the host (stuck modifier) and for our chord bookkeeping.
 		for press in presses {
 			if let usage = press.key?.keyCode, suppressedKeyUps.remove(usage) != nil {
-				chordTrackPressEnded(press.key)
+				chordTrackPressEnded(usage)
 				continue
 			}
-			CParsec.sendKeyboardMessage(event: KeyBoardKeyEvent(input: press.key, isPressBegin: false))
-			chordTrackPressEnded(press.key)
+			if let keyEvent = remoteKeyEvent(press.key?.keyCode, pressed: false) {
+				CParsec.sendKeyboardMessage(
+					event: keyEvent,
+					releaseReason: .cancelled
+				)
+			}
+			chordTrackPressEnded(press.key?.keyCode)
 		}
 		// Any interruption invalidates an in-flight chord.
 		chordArmed = false
@@ -671,10 +1034,13 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 	// feature is enabled, the key is the grave/backtick, and NO Cmd/Ctrl/Alt/
 	// Shift is held (so Shift+` = tilde and Cmd+` still reach the host as normal
 	// keys). Caps Lock and other non-blocking flags are ignored.
-	private func backtickWillEmulateCmdSpace(_ key: UIKey?) -> Bool {
-		guard SettingsHandler.backtickEmulatesCmdSpace, let key = key else { return false }
-		guard key.keyCode == .keyboardGraveAccentAndTilde else { return false }
-		return key.modifierFlags.isDisjoint(with: [.command, .control, .alternate, .shift])
+	private func backtickWillEmulateCmdSpace(
+		_ usage: UIKeyboardHIDUsage,
+		modifiers: UIKeyModifierFlags
+	) -> Bool {
+		guard SettingsHandler.backtickEmulatesCmdSpace,
+		      usage == .keyboardGraveAccentAndTilde else { return false }
+		return modifiers.isDisjoint(with: [.command, .control, .alternate, .shift])
 	}
 
 	// MARK: Ctrl+Shift → Cmd+Space chord machine (S05)
@@ -710,8 +1076,8 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 			|| heldModifierKeyCodes.contains(.keyboardRightGUI)
 	}
 
-	private func chordTrackPressBegan(_ key: UIKey?) {
-		guard SettingsHandler.ctrlShiftEmulatesCmdSpace, let usage = key?.keyCode else { return }
+	private func chordTrackPressBegan(_ usage: UIKeyboardHIDUsage) {
+		guard SettingsHandler.ctrlShiftEmulatesCmdSpace else { return }
 		if isModifierUsage(usage) {
 			heldModifierKeyCodes.insert(usage)
 			// Arm only on a clean Ctrl+Shift with no foreign modifier.
@@ -728,8 +1094,8 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		}
 	}
 
-	private func chordTrackPressEnded(_ key: UIKey?) {
-		guard let usage = key?.keyCode else { return }
+	private func chordTrackPressEnded(_ usage: UIKeyboardHIDUsage?) {
+		guard let usage else { return }
 		guard SettingsHandler.ctrlShiftEmulatesCmdSpace else {
 			// Setting may have flipped off mid-hold; keep the held-set honest.
 			if isModifierUsage(usage) { heldModifierKeyCodes.remove(usage) }
@@ -750,7 +1116,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		// FIRST release while the other modifier is still down — so dropping
 		// Ctrl to continue with Shift+<key> would spuriously emit Cmd+Space.
 		if wasArmed && cleanRelease && isCtrlOrShift && !chordHasControl() && !chordHasShift() {
-			fireCmdSpace()
+			fireCmdSpace(source: "ctrl-shift")
 		}
 		// Once neither Ctrl nor Shift remains, fully reset.
 		if !chordHasControl() && !chordHasShift() {
@@ -759,16 +1125,31 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		}
 	}
 
-	private func fireCmdSpace() {
-		// LGUI = left Cmd. Press Cmd → tap Space → release Cmd, with the same
-		// ~50 ms modifier-hold the layout-sync chord uses so the host registers
-		// the combo intact. Note: iPadOS owns the *physical* Cmd+Space, but here
-		// we synthesize it as host scancodes, which the host honors.
-		CParsec.sendVirtualKeyboardInput(text: "LGUI", isOn: true)
-		CParsec.sendVirtualKeyboardInput(text: "SPACE")
-		DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-			CParsec.sendVirtualKeyboardInput(text: "LGUI", isOn: false)
+	private func fireCmdSpace(source: String) {
+		// iPadOS owns the physical Cmd+Space chord. The explicit host macro uses
+		// the S08 state boundary and cannot leave a delayed modifier behind.
+		sendHostLanguageSwitch(source: source) {
+			CParsec.sendMacShortcut(.spotlightOrInputSource)
 		}
+	}
+
+	private var lastHostLanguageSwitchAt: CFTimeInterval = 0
+
+	/// Every host input-source toggle goes through here: Globe sync, ⌃⇧ and `.
+	/// Two toggles within 0.8 s land back on the original layout ("switched
+	/// and immediately back"), e.g. a ⌃⇧ macro plus an iPad language change from
+	/// the same keypress, so the second one is dropped. Logged with its source.
+	func sendHostLanguageSwitch(source: String, send: () -> Void) {
+		let now = CACurrentMediaTime()
+		let duplicate = Self.isDuplicateLanguageSwitch(now: now, last: lastHostLanguageSwitchAt)
+		Diagnostics.note("layout-switch source=\(source) sent=\(!duplicate)")
+		guard !duplicate else { return }
+		lastHostLanguageSwitchAt = now
+		send()
+	}
+
+	static func isDuplicateLanguageSwitch(now: CFTimeInterval, last: CFTimeInterval) -> Bool {
+		last > 0 && now - last < 0.8
 	}
 	
 	@objc func keyboardWillShow(notification: NSNotification) {
@@ -796,6 +1177,8 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 	}
 
 	@objc func keyboardWillHide(notification: NSNotification) {
+		CParsec.releaseAllKeyboardKeys(reason: .focusLost)
+		resetKeyboardBookkeeping()
 		keyboardHeight = 0.0
         keyboardVisible = false
         
@@ -846,39 +1229,65 @@ extension ParsecViewController : UIGestureRecognizerDelegate {
 
 	@objc func handlePanGesture(_ gestureRecognizer: UIPanGestureRecognizer)
 	{
+		// Any new direct-touch interaction means the user has taken control back
+		// from a client-generated momentum tail.
+		if ParsecTouchInteractionPolicy.shouldInterruptScrollMomentum(
+			for: gestureRecognizer.state
+		) {
+			stopScrollMomentum()
+		}
+
 		//		print("number = \(gestureRecognizer.numberOfTouches) status = \(gestureRecognizer.state.rawValue)")
 		// lock activatedPanFingerNumber in case user not releasing both finger at the same time
-		if gestureRecognizer.numberOfTouches == 0 {
-			if gestureRecognizer.state == .ended || gestureRecognizer.state == .cancelled {
+		// Key cleanup on the terminal state, not touch count: a cancel/fail can
+		// still report touches, which used to leave the direct-mode left button held.
+		let panFinished = [.ended, .cancelled, .failed].contains(gestureRecognizer.state)
+		if panFinished || gestureRecognizer.numberOfTouches == 0 {
+			if panFinished {
+				if activatedPanFingerNumber == 2 {
+					touchScrollAccumulator.reset()
+					lastTouchScrollTranslation = .zero
+				}
 				activatedPanFingerNumber = 0
-				// Reset accumulators
-				accumulatedDeltaX = 0.0
-				accumulatedDeltaY = 0.0
+				pointerDeltaAccumulator.reset()
 				lastPanTranslation = .zero
 
 				if SettingsHandler.cursorMode == .direct {
-					let button = ParsecMouseButton.init(rawValue: 1)
-					CParsec.sendMouseClickMessage(button, false)
+					let button = RemoteMouseButton.init(rawValue: 1)
+					CParsec.sendMouseClickMessage(
+						button,
+						false,
+						releaseReason: gestureRecognizer.state == .ended
+							? .normal
+							: .gestureCancelled
+					)
 				}
 			}
 		} else if activatedPanFingerNumber == 2 || (gestureRecognizer.numberOfTouches == 2 && activatedPanFingerNumber == 0) {
-            // Native UIScrollView handles 2-finger pan for scrolling.
-            // We disable the mouse wheel for now to avoid conflict, or we can check gesture state.
-            // If user wants wheel, we might need a specific mode or 3 fingers.
-			if zoomEnabled {
-				return
-			}
+			// Lock the two-finger mode first so a zoomed pan never falls
+			// through to one-finger mouse motion when a finger lifts.
 			activatedPanFingerNumber = 2
-			let velocity = gestureRecognizer.velocity(in: gestureRecognizer.view)
-			
-			if abs(velocity.y) > 2 {
-				// Run your function when the user uses two fingers and swipes upwards
-				CParsec.sendWheelMsg(x: 0, y: Int32(Float(velocity.y) / 20 * mouseSensitivity))
+			// While actually zoomed, UIScrollView exclusively consumes the
+			// two-finger pan (zoom setting on at 1.0x still forwards).
+			guard shouldForwardRemoteScroll else {
+				// Keep the anchor fresh so un-zooming mid-gesture can't jump.
+				lastTouchScrollTranslation = gestureRecognizer.translation(in: gestureRecognizer.view)
 				return
 			}
-			if SettingsHandler.cursorMode == .direct {
-				let location = gestureRecognizer.location(in:gestureRecognizer.view)
-				touchController.onTouch(typeOfTap: 1, location: location, state: gestureRecognizer.state)
+			let translation = gestureRecognizer.translation(in: gestureRecognizer.view)
+			if gestureRecognizer.state == .began {
+				lastTouchScrollTranslation = .zero
+				touchScrollAccumulator.reset()
+			}
+			let transformed = ParsecPointerTransform.scroll(
+				x: Double(translation.x - lastTouchScrollTranslation.x),
+				y: Double(translation.y - lastTouchScrollTranslation.y),
+				sensitivity: SettingsHandler.scrollSensitivity,
+				natural: SettingsHandler.naturalScrolling
+			)
+			lastTouchScrollTranslation = translation
+			if let whole = touchScrollAccumulator.consume(transformed) {
+				CParsec.sendWheelMsg(x: whole.x, y: whole.y)
 			}
 		} else if activatedPanFingerNumber == 1 || (gestureRecognizer.numberOfTouches == 1 && activatedPanFingerNumber == 0) {
 			activatedPanFingerNumber = 1
@@ -888,7 +1297,10 @@ extension ParsecViewController : UIGestureRecognizerDelegate {
 				let position = gestureRecognizer.location(in: gestureRecognizer.view)
                 // Convert to content coordinates
 				let adjustedPosition = contentView.convert(position, from: view)
-				CParsec.sendMousePosition(Int32(adjustedPosition.x), Int32(adjustedPosition.y))
+				// Clamped to the content (finite, in range) before the Int32 conversion.
+				let px = adjustedPosition.x.isFinite ? min(max(adjustedPosition.x, 0), contentView.bounds.width) : 0
+				let py = adjustedPosition.y.isFinite ? min(max(adjustedPosition.y, 0), contentView.bounds.height) : 0
+				CParsec.sendMousePosition(Int32(px), Int32(py))
 				moveLocalCursor(to: adjustedPosition)
 			} else {
 				// Simple translation-based movement with sub-pixel accumulation
@@ -896,42 +1308,27 @@ extension ParsecViewController : UIGestureRecognizerDelegate {
 
 				if gestureRecognizer.state == .began {
 					lastPanTranslation = .zero
-					accumulatedDeltaX = 0.0
-					accumulatedDeltaY = 0.0
+					pointerDeltaAccumulator.reset()
 				}
 
-				// Calculate delta since last update at full precision, with
-				// the combined sensitivity × acceleration curve.
-				let rawDX = currentTranslation.x - lastPanTranslation.x
-				let rawDY = currentTranslation.y - lastPanTranslation.y
-				let scale = effectiveDeltaScale(rawDX: rawDX, rawDY: rawDY)
-				let preciseDX = rawDX * scale
-				let preciseDY = rawDY * scale
-
+				let transformed = ParsecPointerTransform.movement(
+					x: Double(currentTranslation.x - lastPanTranslation.x),
+					y: Double(currentTranslation.y - lastPanTranslation.y),
+					sensitivity: SettingsHandler.mouseSensitivity,
+					acceleration: SettingsHandler.mouseAcceleration
+				)
 				lastPanTranslation = currentTranslation
-
-				// Move the LOCAL cursor at full sub-pixel precision so its
-				// motion stays smooth even between whole-pixel host deltas.
-				moveLocalCursor(byX: preciseDX, y: preciseDY)
-
-				// Accumulate for sub-pixel precision, then round-half-away-
-				// from-zero so 0.4-px ticks still emit a 1-pixel message
-				// (Int32 truncation made slow drags feel sticky).
-				accumulatedDeltaX += Float(preciseDX)
-				accumulatedDeltaY += Float(preciseDY)
-
-				let intDeltaX = Int32(accumulatedDeltaX.rounded(.toNearestOrAwayFromZero))
-				let intDeltaY = Int32(accumulatedDeltaY.rounded(.toNearestOrAwayFromZero))
-
-				if intDeltaX != 0 || intDeltaY != 0 {
-					CParsec.sendMouseDelta(intDeltaX, intDeltaY)
-					accumulatedDeltaX -= Float(intDeltaX)
-					accumulatedDeltaY -= Float(intDeltaY)
+				moveLocalCursor(
+					byX: CGFloat(transformed.x),
+					y: CGFloat(transformed.y)
+				)
+				if let whole = pointerDeltaAccumulator.consume(transformed) {
+					CParsec.sendMouseDelta(whole.x, whole.y)
 				}
 			}
 
 			if gestureRecognizer.state == .began && SettingsHandler.cursorMode == .direct {
-				let button = ParsecMouseButton.init(rawValue: 1)
+				let button = RemoteMouseButton.init(rawValue: 1)
 				CParsec.sendMouseClickMessage(button, true)
 			}
 
@@ -950,18 +1347,25 @@ extension ParsecViewController : UIGestureRecognizerDelegate {
 		// translation deltas without flipping — host applies its own
 		// inversion. Flip only when toggle is OFF (= user wants classic
 		// mouse-wheel feel).
-		let direction: Float = SettingsHandler.naturalScrolling ? 1.0 : -1.0
-		let sensitivity = Float(SettingsHandler.scrollSensitivity)
+		// Some Magic Keyboard sequences resume at `.changed` without exposing a
+		// fresh `.began`; stop the old glide before any live delta in either case.
+		if ParsecTouchInteractionPolicy.shouldInterruptTrackpadMomentum(
+			for: gestureRecognizer.state
+		) {
+			stopScrollMomentum()
+		}
+		// Captured (pointer-locked) mode: GCMouse scroll owns the wheel, so this
+		// recognizer must not send too (GamepadController.sendMouseScroll).
+		guard pointerBehavior.inputRoute == .absolute else { return }
 
 		switch gestureRecognizer.state {
 		case .began:
-			// A fresh scroll cancels any glide still in progress.
-			stopScrollMomentum()
+			// Reset live-scroll anchors for the new gesture.
 			lastScrollTranslation = .zero
-			accumulatedScrollX = 0.0
-			accumulatedScrollY = 0.0
+			trackpadScrollAccumulator.reset()
 			peakScrollVelocityX = 0
 			peakScrollVelocityY = 0
+			trackpadScrollTravel = 0
 		case .changed:
 			let translation = gestureRecognizer.translation(in: gestureRecognizer.view)
 			// When the user is zoomed in, let UIScrollView's own pan handle the
@@ -975,8 +1379,15 @@ extension ParsecViewController : UIGestureRecognizerDelegate {
 				return
 			}
 
-			let deltaX = Float(translation.x - lastScrollTranslation.x) * sensitivity * direction
-			let deltaY = Float(translation.y - lastScrollTranslation.y) * sensitivity * direction
+			let deltaX = translation.x - lastScrollTranslation.x
+			let deltaY = translation.y - lastScrollTranslation.y
+			trackpadScrollTravel += hypot(deltaX, deltaY)
+			let transformed = ParsecPointerTransform.scroll(
+				x: Double(deltaX),
+				y: Double(deltaY),
+				sensitivity: SettingsHandler.scrollSensitivity,
+				natural: SettingsHandler.naturalScrolling
+			)
 			lastScrollTranslation = translation
 
 			// Track the peak velocity over the gesture. `velocity(in:)` at
@@ -984,20 +1395,19 @@ extension ParsecViewController : UIGestureRecognizerDelegate {
 			// scroll-event stream, so we seed the post-lift glide from the peak
 			// seen mid-gesture instead.
 			let v = gestureRecognizer.velocity(in: gestureRecognizer.view)
-			if abs(v.x) > abs(peakScrollVelocityX) { peakScrollVelocityX = v.x }
-			if abs(v.y) > abs(peakScrollVelocityY) { peakScrollVelocityY = v.y }
+			let peak = ParsecScrollMomentumPolicy.peakVelocity(
+				current: ParsecInputDelta(
+					x: Double(peakScrollVelocityX),
+					y: Double(peakScrollVelocityY)
+				),
+				candidate: ParsecInputDelta(x: Double(v.x), y: Double(v.y))
+			)
+			peakScrollVelocityX = CGFloat(peak.x)
+			peakScrollVelocityY = CGFloat(peak.y)
 
-			accumulatedScrollX += deltaX
-			accumulatedScrollY += deltaY
-			// Rounding accumulator: Int32 truncation previously swallowed
-			// sub-pixel ticks so slow trackpad scrolls felt dead until enough
-			// whole pixels piled up.
-			let intX = Int32(accumulatedScrollX.rounded(.toNearestOrAwayFromZero))
-			let intY = Int32(accumulatedScrollY.rounded(.toNearestOrAwayFromZero))
-			if intX != 0 || intY != 0 {
-				CParsec.sendWheelMsg(x: intX, y: intY)
-				accumulatedScrollX -= Float(intX)
-				accumulatedScrollY -= Float(intY)
+			if let whole = trackpadScrollAccumulator.consume(transformed) {
+				CParsec.sendWheelMsg(x: whole.x, y: whole.y)
+				scrollLiveUnits += abs(Int(whole.x)) + abs(Int(whole.y))
 			}
 		case .ended:
 			// Seed a decaying glide from the peak velocity (scaled the same way
@@ -1005,20 +1415,47 @@ extension ParsecViewController : UIGestureRecognizerDelegate {
 			// remainder isn't lost between the live phase and the glide.
 			lastScrollTranslation = .zero
 			if scrollView.zoomScale <= 1.0 {
-				startScrollMomentum(
-					velX: Float(peakScrollVelocityX) * sensitivity * direction,
-					velY: Float(peakScrollVelocityY) * sensitivity * direction
+				let seed = ParsecScrollMomentumPolicy.glideSeed(ParsecInputDelta(
+					x: Double(peakScrollVelocityX),
+					y: Double(peakScrollVelocityY)
+				))
+				let velocity = ParsecPointerTransform.scroll(
+					x: seed.x,
+					y: seed.y,
+					sensitivity: SettingsHandler.scrollSensitivity,
+					natural: SettingsHandler.naturalScrolling
 				)
+				// Decide on the unscaled speed so Scroll Sensitivity changes
+				// distance only, not whether a release glides.
+				let peakSpeed = hypot(seed.x, seed.y)
+				Diagnostics.note(
+					"scroll-gesture travel=\(Int(trackpadScrollTravel)) liveUnits=\(scrollLiveUnits) " +
+					"peak=\(Int(hypot(peakScrollVelocityX, peakScrollVelocityY))) seed=\(Int(peakSpeed)) " +
+					"sens=\(SettingsHandler.scrollSensitivity) natural=\(SettingsHandler.naturalScrolling)"
+				)
+				scrollLiveUnits = 0
+				if ParsecScrollMomentumPolicy.shouldStart(
+					travel: Double(trackpadScrollTravel),
+					peakSpeed: peakSpeed
+				) {
+					startScrollMomentum(
+						velX: Float(velocity.x),
+						velY: Float(velocity.y)
+					)
+				} else {
+					stopScrollMomentum()
+				}
 			}
 			peakScrollVelocityX = 0
 			peakScrollVelocityY = 0
+			trackpadScrollTravel = 0
 		case .cancelled, .failed:
 			stopScrollMomentum()
 			lastScrollTranslation = .zero
-			accumulatedScrollX = 0.0
-			accumulatedScrollY = 0.0
+			trackpadScrollAccumulator.reset()
 			peakScrollVelocityX = 0
 			peakScrollVelocityY = 0
+			trackpadScrollTravel = 0
 		default:
 			break
 		}
@@ -1028,8 +1465,16 @@ extension ParsecViewController : UIGestureRecognizerDelegate {
 
 	private func startScrollMomentum(velX: Float, velY: Float) {
 		stopScrollMomentum()
-		// Don't bother gliding for a near-stationary release.
-		guard hypotf(velX, velY) >= scrollMomentumStartSpeed else { return }
+		let maximumDuration = ParsecScrollMomentumPolicy.clampedDuration(
+			SettingsHandler.scrollGlideDuration
+		)
+		guard ParsecScrollMomentumPolicy.shouldContinue(
+			elapsed: 0,
+			maximumDuration: maximumDuration
+		) else {
+			return
+		}
+		momentumElapsed = 0
 		momentumVelocityX = velX
 		momentumVelocityY = velY
 		let link = CADisplayLink(target: self, selector: #selector(stepScrollMomentum(_:)))
@@ -1044,15 +1489,25 @@ extension ParsecViewController : UIGestureRecognizerDelegate {
 		// first-tick / stall values.
 		let dt = Float(link.targetTimestamp - link.timestamp)
 		guard dt > 0, dt < 0.1 else { return }
+		momentumElapsed += TimeInterval(dt)
+		guard ParsecScrollMomentumPolicy.shouldContinue(
+			elapsed: momentumElapsed,
+			maximumDuration: ParsecScrollMomentumPolicy.clampedDuration(
+				SettingsHandler.scrollGlideDuration
+			)
+		) else {
+			stopScrollMomentum()
+			return
+		}
 
-		accumulatedScrollX += momentumVelocityX * dt
-		accumulatedScrollY += momentumVelocityY * dt
-		let intX = Int32(accumulatedScrollX.rounded(.toNearestOrAwayFromZero))
-		let intY = Int32(accumulatedScrollY.rounded(.toNearestOrAwayFromZero))
-		if intX != 0 || intY != 0 {
-			CParsec.sendWheelMsg(x: intX, y: intY)
-			accumulatedScrollX -= Float(intX)
-			accumulatedScrollY -= Float(intY)
+		if let whole = trackpadScrollAccumulator.consume(
+			ParsecInputDelta(
+				x: Double(momentumVelocityX * dt),
+				y: Double(momentumVelocityY * dt)
+			)
+		) {
+			CParsec.sendWheelMsg(x: whole.x, y: whole.y)
+			scrollGlideUnits += abs(Int(whole.x)) + abs(Int(whole.y))
 		}
 
 		let decay = powf(scrollMomentumDecayPerSecond, dt)
@@ -1064,10 +1519,15 @@ extension ParsecViewController : UIGestureRecognizerDelegate {
 	}
 
 	private func stopScrollMomentum() {
+		if momentumDisplayLink != nil {
+			Diagnostics.note("scroll-glide units=\(scrollGlideUnits) elapsed=\(String(format: "%.2f", momentumElapsed))")
+		}
+		scrollGlideUnits = 0
 		momentumDisplayLink?.invalidate()
 		momentumDisplayLink = nil
 		momentumVelocityX = 0
 		momentumVelocityY = 0
+		momentumElapsed = 0
 	}
 
 	@objc func handleSingleFingerTap(_ gestureRecognizer: UITapGestureRecognizer) {
@@ -1103,26 +1563,34 @@ extension ParsecViewController : UIGestureRecognizerDelegate {
 		if SettingsHandler.cursorMode != .touchpad {
 			return
 		}
-		let button = ParsecMouseButton.init(rawValue: 1)
+		let button = RemoteMouseButton.init(rawValue: 1)
 
 		if gestureRecognizer.state == .began{
 			CParsec.sendMouseClickMessage(button, true)
-			let location = gestureRecognizer.location(in: gestureRecognizer.view)
-			lastLongPressPoint = contentView.convert(location, from: view)
 		} else if gestureRecognizer.state == .ended {
 			CParsec.sendMouseClickMessage(button, false)
-		} else if gestureRecognizer.state == .changed {
-			let newLocation = gestureRecognizer.location(in: gestureRecognizer.view)
-            let adjustedNewLocation = contentView.convert(newLocation, from: view)
-			CParsec.sendMouseDelta(
-				Int32(Float(adjustedNewLocation.x - lastLongPressPoint.x) * mouseSensitivity),
-				Int32(Float(adjustedNewLocation.y - lastLongPressPoint.y) * mouseSensitivity)
+		} else if gestureRecognizer.state == .cancelled || gestureRecognizer.state == .failed {
+			CParsec.sendMouseClickMessage(
+				button,
+				false,
+				releaseReason: .gestureCancelled
 			)
-			lastLongPressPoint = adjustedNewLocation
+		} else if gestureRecognizer.state == .changed {
+			// The simultaneous one-finger pan recognizer exclusively owns movement
+			// and applies the shared transform/accumulator. Long press owns only
+			// the left-button latch, avoiding duplicate deltas during drag.
+			return
 		}
 	}
 	
     // UIScrollViewDelegate
+	func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+		// UIScrollView can own a two-finger pan independently of the main direct-
+		// touch recognizer, especially while transitioning into or out of zoom.
+		// Either route must stop a host-scroll momentum tail immediately.
+		stopScrollMomentum()
+	}
+
 	func viewForZooming(in scrollView: UIScrollView) -> UIView? {
 		return contentView
 	}
@@ -1140,7 +1608,7 @@ extension ParsecViewController : UIGestureRecognizerDelegate {
 	
 extension ParsecViewController : UIPointerInteractionDelegate {
 	func pointerInteraction(_ interaction: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? {
-		return UIPointerStyle.hidden()
+		pointerBehavior.prefersPointerLocked ? UIPointerStyle.hidden() : nil
 	}
 
 
@@ -1265,8 +1733,33 @@ extension ParsecViewController : UIKeyInput, UITextInputTraits {
 		let downButton = createKeyboardButton(displayText: "↓", keyText: "DOWN", isToggleable: false)
 		let leftButton = createKeyboardButton(displayText: "←", keyText: "LEFT", isToggleable: false)
 		let rightButton = createKeyboardButton(displayText: "→", keyText: "RIGHT", isToggleable: false)
+		let appSwitcherButton = createKeyboardButton(displayText: "⌘⇥", keyText: "MAC_APP_SWITCHER", isToggleable: false)
+		let inputSourceButton = createKeyboardButton(displayText: "⌘␣", keyText: "MAC_INPUT_SOURCE", isToggleable: false)
+		let closeWindowButton = createKeyboardButton(displayText: "⌘W", keyText: "MAC_CLOSE_WINDOW", isToggleable: false)
+		let forceQuitButton = createKeyboardButton(displayText: "⌘⌥⎋", keyText: "MAC_FORCE_QUIT", isToggleable: false)
+		let windowsAltTabButton = createKeyboardButton(displayText: "Alt⇥", keyText: "WIN_ALT_TAB", isToggleable: false)
+		let windowsStartButton = createKeyboardButton(displayText: "Win", keyText: "WIN_START", isToggleable: false)
+		let windowsLockButton = createKeyboardButton(displayText: "Win L", keyText: "WIN_LOCK", isToggleable: false)
+		let windowsTaskManagerButton = createKeyboardButton(displayText: "Ctrl⇧⎋", keyText: "WIN_TASK_MANAGER", isToggleable: false)
+		let windowsLayoutButton = createKeyboardButton(displayText: "Alt⇧", keyText: "WIN_LAYOUT", isToggleable: false)
 
-		let buttons = [tabBarButton, shiftBarButton, controlBarButton, altBarButton, windowsBarButton, escapeBarButton, f1Button, f2Button, f3Button, f4Button, f5Button, f6Button, f7Button, f8Button, f9Button, f10Button, f11Button, f12Button, deleteBarButton, upButton, downButton, leftButton, rightButton]
+		var buttons = [tabBarButton, shiftBarButton, controlBarButton, altBarButton, windowsBarButton, escapeBarButton, f1Button, f2Button, f3Button, f4Button, f5Button, f6Button, f7Button, f8Button, f9Button, f10Button, f11Button, f12Button, deleteBarButton, upButton, downButton, leftButton, rightButton]
+		let shortcutVisibility = ParsecHostShortcutToolbarPolicy.visibility(
+			mode: SettingsHandler.hostShortcutToolbarMode,
+			host: CParsec.hostOS
+		)
+		if shortcutVisibility.showMac {
+			buttons.insert(
+				contentsOf: [appSwitcherButton, inputSourceButton, closeWindowButton, forceQuitButton],
+				at: 0
+			)
+		}
+		if shortcutVisibility.showWindows {
+			buttons.insert(
+				contentsOf: [windowsAltTabButton, windowsStartButton, windowsLockButton, windowsTaskManagerButton, windowsLayoutButton],
+				at: 0
+			)
+		}
 
 		for button in buttons {
 			buttonStackView.addArrangedSubview(button)
@@ -1322,6 +1815,14 @@ extension ParsecViewController : UIKeyInput, UITextInputTraits {
 	}
 	
 	@objc func toolbarButtonClicked(_ sender: KeyboardButton) {
+		if let action = windowsShortcutAction(for: sender.keyText) {
+			CParsec.sendWindowsShortcut(action)
+			return
+		}
+		if let action = macShortcutAction(for: sender.keyText) {
+			CParsec.sendMacShortcut(action, route: .explicitMacro)
+			return
+		}
 		let isToggleable = sender.isToggleable
 		var isOn = sender.isOn
 
@@ -1350,6 +1851,31 @@ extension ParsecViewController : UIKeyInput, UITextInputTraits {
 		
 	}
 	
+	private func windowsShortcutAction(
+		for keyText: String
+	) -> ParsecWindowsShortcutAction? {
+		switch keyText {
+		case "WIN_ALT_TAB": return .appSwitcher
+		case "WIN_START": return .startMenu
+		case "WIN_LOCK": return .lockWorkstation
+		case "WIN_TASK_MANAGER": return .taskManager
+		case "WIN_LAYOUT": return .layoutSwitch
+		default: return nil
+		}
+	}
+
+	private func macShortcutAction(
+		for keyText: String
+	) -> ParsecMacShortcutAction? {
+		switch keyText {
+		case "MAC_APP_SWITCHER": return .appSwitcher
+		case "MAC_INPUT_SOURCE": return .spotlightOrInputSource
+		case "MAC_CLOSE_WINDOW": return .closeWindow
+		case "MAC_FORCE_QUIT": return .forceQuit
+		default: return nil
+		}
+	}
+
 	@objc func doneTapped() {
 		// Resign first responder to dismiss the keyboard
 		resignFirstResponder()
@@ -1419,13 +1945,13 @@ extension ParsecViewController {
 	// commands. Rebuilds itself the first time captureSystemKeys flips on
 	// during a session and the user re-enters the streaming view.
 	private static let _capturableCharset: String = "abcdefghijklmnopqrstuvwxyz0123456789-=[];',./`\\"
-	private static let _capturableModifierCombos: [UIKeyModifierFlags] = [
+	// Command-only: registering plain Option chords turned held Option+key
+	// into instant taps (key repeat / hold semantics lost on the host).
+	static let _capturableModifierCombos: [UIKeyModifierFlags] = [
 		.command,
 		[.command, .shift],
 		[.command, .alternate],
-		[.command, .control],
-		.alternate,
-		[.alternate, .shift]
+		[.command, .control]
 	]
 
 	// iOS queries `keyCommands` on every key event and on every first-responder
@@ -1484,48 +2010,46 @@ extension ParsecViewController {
 	// managing modifiers explicitly.
 	@objc func handleCapturedKey(_ cmd: UIKeyCommand) {
 		let mods = cmd.modifierFlags
+		guard let raw = cmd.input, !raw.isEmpty else { return }
+		Diagnostics.note("key-chord via=keycommand input=\(raw.unicodeScalars.map { $0.value }) mods=\(mods.rawValue)")
 
-		if mods.contains(.command) { CParsec.sendVirtualKeyboardInput(text: "LGUI", isOn: true) }
-		if mods.contains(.shift)   { CParsec.sendVirtualKeyboardInput(text: "SHIFT", isOn: true) }
-		if mods.contains(.control) { CParsec.sendVirtualKeyboardInput(text: "CONTROL", isOn: true) }
-		if mods.contains(.alternate) { CParsec.sendVirtualKeyboardInput(text: "LALT", isOn: true) }
-
-		guard let raw = cmd.input, !raw.isEmpty else {
-			releaseHeldModifiers(mods)
+		if mods.contains(.command), raw == "\t" {
+			CParsec.sendMacShortcut(.appSwitcher)
+			return
+		}
+		if mods.contains(.command), raw == " " {
+			CParsec.sendMacShortcut(.spotlightOrInputSource)
 			return
 		}
 
 		let keyText: String
 		switch raw {
 		case "\t": keyText = "TAB"
-		case " ":  keyText = "SPACE"
+		case " ": keyText = "SPACE"
 		case "\r", "\n": keyText = "ENTER"
-		default:   keyText = raw.uppercased()
+		default: keyText = raw.uppercased()
 		}
+		guard let key = KeyCodeTranslators.parsecKeyCodeTranslator(keyText) else { return }
 
-		CParsec.sendVirtualKeyboardInput(text: keyText, isOn: true)
-		// In Low Latency Mode we send keyup + modifier-release synchronously,
-		// avoiding ~80 ms of artificial hold time on every Cmd-shortcut. The
-		// old asyncAfter path was originally there as a defensive hold-time
-		// for games that misread instant releases — not needed on macOS.
-		if SettingsHandler.lowLatencyMode {
-			CParsec.sendVirtualKeyboardInput(text: keyText, isOn: false)
-			releaseHeldModifiers(mods)
-		} else {
-			DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
-				CParsec.sendVirtualKeyboardInput(text: keyText, isOn: false)
-			}
-			DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-				self?.releaseHeldModifiers(mods)
-			}
+		var chord: [RemoteKeyCode] = []
+		if mods.contains(.command),
+		   let modifier = KeyCodeTranslators.parsecKeyCodeTranslator("LGUI") {
+			chord.append(modifier)
 		}
-	}
-
-	private func releaseHeldModifiers(_ mods: UIKeyModifierFlags) {
-		if mods.contains(.command) { CParsec.sendVirtualKeyboardInput(text: "LGUI", isOn: false) }
-		if mods.contains(.shift)   { CParsec.sendVirtualKeyboardInput(text: "SHIFT", isOn: false) }
-		if mods.contains(.control) { CParsec.sendVirtualKeyboardInput(text: "CONTROL", isOn: false) }
-		if mods.contains(.alternate) { CParsec.sendVirtualKeyboardInput(text: "LALT", isOn: false) }
+		if mods.contains(.shift),
+		   let modifier = KeyCodeTranslators.parsecKeyCodeTranslator("SHIFT") {
+			chord.append(modifier)
+		}
+		if mods.contains(.control),
+		   let modifier = KeyCodeTranslators.parsecKeyCodeTranslator("CONTROL") {
+			chord.append(modifier)
+		}
+		if mods.contains(.alternate),
+		   let modifier = KeyCodeTranslators.parsecKeyCodeTranslator("LALT") {
+			chord.append(modifier)
+		}
+		chord.append(key)
+		CParsec.sendKeyboardChord(chord, route: .priorityCapture)
 	}
 }
 
@@ -1550,10 +2074,14 @@ extension ParsecViewController {
 // continue to flow through the existing pipeline.
 extension ParsecViewController {
 	func startLanguageSyncIfNeeded() {
-		guard SettingsHandler.syncKeyboardLayout, languageSync == nil else { return }
+		// Always run: the hidden field is also what holds first responder so
+		// hardware keys keep arriving. The setting only gates the hotkey.
+		guard languageSync == nil else { return }
 		let coordinator = LanguageSyncCoordinator(host: self, keyForwardTarget: self)
-		coordinator.onLanguageChange = { [weak self] _ in
-			self?.sendLayoutSyncHotkey()
+		coordinator.onLanguageChange = { [weak self] language in
+			Diagnostics.note("layout-sync event=change lang=\(language ?? "nil") enabled=\(SettingsHandler.syncKeyboardLayout) hotkey=\(SettingsHandler.layoutSyncHotkey)")
+			guard SettingsHandler.syncKeyboardLayout, let self else { return }
+			self.sendHostLanguageSwitch(source: "globe") { self.sendLayoutSyncHotkey() }
 		}
 		coordinator.start()
 		languageSync = coordinator
@@ -1565,44 +2093,33 @@ extension ParsecViewController {
 	}
 
 	func sendLayoutSyncHotkey() {
-		let hotkey = SettingsHandler.layoutSyncHotkey
-		switch hotkey {
+		switch SettingsHandler.layoutSyncHotkey {
 		case .none:
 			return
 		case .ctrlSpace:
-			tapKey(modifierKey: "CONTROL", normalKey: "SPACE")
+			sendExplicitChord(["CONTROL", "SPACE"])
 		case .cmdSpace:
-			tapKey(modifierKey: "LGUI", normalKey: "SPACE")
+			// ⌘Space on a Mac host, Win+Space (the layout switcher) on Windows.
+			// Raw so the Windows "⌘ sends Ctrl" mode can't turn it into Ctrl+Space.
+			sendExplicitChord(["LGUI", "SPACE"], mappingIntent: .raw)
 		case .altSpace:
-			tapKey(modifierKey: "LALT", normalKey: "SPACE")
+			sendExplicitChord(["LALT", "SPACE"])
 		case .altShift:
-			tapModifierChord(firstModifier: "LALT", secondModifier: "SHIFT")
+			sendExplicitChord(["LALT", "SHIFT"])
 		case .ctrlShift:
-			tapModifierChord(firstModifier: "CONTROL", secondModifier: "SHIFT")
+			sendExplicitChord(["CONTROL", "SHIFT"])
 		}
 	}
 
-	// Press modifier → press+release normal key → release modifier. The
-	// release of the normal key is async (+20ms) inside CParsec, so we delay
-	// the modifier release by ~50ms to keep the chord intact on the host.
-	private func tapKey(modifierKey: String, normalKey: String) {
-		CParsec.sendVirtualKeyboardInput(text: modifierKey, isOn: true)
-		CParsec.sendVirtualKeyboardInput(text: normalKey)
-		DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-			CParsec.sendVirtualKeyboardInput(text: modifierKey, isOn: false)
+	private func sendExplicitChord(
+		_ keyNames: [String],
+		mappingIntent: ParsecKeyboardMappingIntent = .configured
+	) {
+		let chord = keyNames.compactMap {
+			KeyCodeTranslators.parsecKeyCodeTranslator($0)
 		}
-	}
-
-	// Two modifiers held + released as a chord (e.g. Alt+Shift on Windows).
-	private func tapModifierChord(firstModifier: String, secondModifier: String) {
-		CParsec.sendVirtualKeyboardInput(text: firstModifier, isOn: true)
-		CParsec.sendVirtualKeyboardInput(text: secondModifier, isOn: true)
-		DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
-			CParsec.sendVirtualKeyboardInput(text: secondModifier, isOn: false)
-		}
-		DispatchQueue.main.asyncAfter(deadline: .now() + 0.07) {
-			CParsec.sendVirtualKeyboardInput(text: firstModifier, isOn: false)
-		}
+		guard chord.count == keyNames.count else { return }
+		CParsec.sendKeyboardChord(chord, route: .explicitMacro, mappingIntent: mappingIntent)
 	}
 }
 
@@ -1616,12 +2133,13 @@ final class LanguageSyncTextField: UITextField {
 
 	override var canBecomeFirstResponder: Bool { return true }
 
-	// Returning an empty UIView for inputView suppresses the on-screen keyboard
-	// while the field is first responder, even without a connected hardware
-	// keyboard.
+	// Without a hardware keyboard, an empty inputView keeps the on-screen
+	// keyboard from popping up. With one attached the soft keyboard never
+	// shows anyway, and a custom inputView would hide the real input mode
+	// (textInputMode → nil), so Globe switches could not be detected.
 	private let _emptyInputView = UIView()
 	override var inputView: UIView? {
-		get { return _emptyInputView }
+		get { return GCKeyboard.coalesced == nil ? _emptyInputView : nil }
 		set { /* ignore — we want the soft kb suppressed unconditionally */ }
 	}
 
@@ -1678,18 +2196,14 @@ final class LanguageSyncCoordinator {
 	private var hiddenField: LanguageSyncTextField?
 	private var observer: NSObjectProtocol?
 	private var lastLanguage: String?
-	// True once we've observed at least one notification (or seeded a
-	// non-nil value asynchronously). Until then, treat any change as the
-	// initial state and don't fire the host hotkey — otherwise every
-	// session start spuriously sends Ctrl+Space because `lastLanguage`
-	// reads as nil immediately after becomeFirstResponder and the first
-	// real notification looks like "nil → en-US".
-	private var hasSeenInitialLanguage = false
+	private var foregroundObserver: NSObjectProtocol?
+	private var keyboardObservers: [NSObjectProtocol] = []
 	// Debounce: rapid Caps-Lock taps can fire the notification twice on
 	// some iPadOS versions, which would interleave modifier press/release
 	// chords on the host. 150 ms is comfortably below typical typing
 	// rhythm but above iPadOS double-fire window.
 	private var lastHotkeyAt: CFTimeInterval = 0
+	private var lastFocusAt: CFTimeInterval = 0
 	var onLanguageChange: ((String?) -> Void)?
 
 	init(host: UIViewController, keyForwardTarget: UIResponder) {
@@ -1710,18 +2224,25 @@ final class LanguageSyncCoordinator {
 		field.smartInsertDeleteType = .no
 		field.keyForwardTarget = keyForwardTarget
 		hostView.addSubview(field)
+		noteFocusChange()
 		field.becomeFirstResponder()
 		hiddenField = field
+		Diagnostics.note("layout-sync event=start firstResponder=\(field.isFirstResponder) hardwareKeyboard=\(GCKeyboard.coalesced != nil) lang=\(field.textInputMode?.primaryLanguage ?? "nil")")
 
-		// Defer seeding: textInputMode is sometimes still nil right after
-		// becomeFirstResponder. Asynchronously read on the next run-loop
-		// tick, by which point iOS has updated it.
-		DispatchQueue.main.async { [weak self] in
-			guard let self = self else { return }
-			if !self.hasSeenInitialLanguage {
-				self.lastLanguage = self.currentLanguage(from: nil)
-				self.hasSeenInitialLanguage = true
-			}
+		// Returning to the app restores first responder and posts a mode
+		// notification: a focus move, not a user switch.
+		foregroundObserver = NotificationCenter.default.addObserver(
+			forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+		) { [weak self] _ in self?.noteFocusChange() }
+		// The field swaps its empty inputView when a hardware keyboard comes
+		// or goes (see LanguageSyncTextField.inputView).
+		for name in [Notification.Name.GCKeyboardDidConnect, .GCKeyboardDidDisconnect] {
+			keyboardObservers.append(NotificationCenter.default.addObserver(
+				forName: name, object: nil, queue: .main
+			) { [weak self] _ in
+				self?.noteFocusChange()
+				self?.hiddenField?.reloadInputViews()
+			})
 		}
 
 		observer = NotificationCenter.default.addObserver(
@@ -1738,6 +2259,12 @@ final class LanguageSyncCoordinator {
 			NotificationCenter.default.removeObserver(obs)
 			observer = nil
 		}
+		if let obs = foregroundObserver {
+			NotificationCenter.default.removeObserver(obs)
+			foregroundObserver = nil
+		}
+		keyboardObservers.forEach(NotificationCenter.default.removeObserver)
+		keyboardObservers = []
 		hiddenField?.resignFirstResponder()
 		hiddenField?.removeFromSuperview()
 		hiddenField = nil
@@ -1746,32 +2273,55 @@ final class LanguageSyncCoordinator {
 	// Step aside so the host view controller can become first responder
 	// (e.g. when the soft keyboard is shown via 3-finger tap).
 	func yieldFirstResponder() {
+		noteFocusChange()
 		hiddenField?.resignFirstResponder()
 	}
 
 	// Re-take first-responder status when the host VC has resigned (typically
 	// after the soft keyboard is dismissed).
 	func reclaimFirstResponder() {
+		noteFocusChange()
 		hiddenField?.becomeFirstResponder()
 	}
 
+	// Fires the host chord only for a real switch between two KNOWN input
+	// languages. Focus moves (start, soft keyboard show/hide, foreground,
+	// sheets) also post this notification, so within 0.5 s of one we only
+	// re-seed. A toggle chord stays in sync only if every real switch sends
+	// exactly one chord and nothing else does.
 	private func handleChange(note: Notification) {
 		let lang = currentLanguage(from: note)
-		// On user reports the previous initial-seed + 150 ms debounce gates
-		// were swallowing legitimate hotkey fires (the very first iPad layout
-		// switch after a session start in particular). Loosened: only skip if
-		// the language string actually hasn't changed. A stray duplicate
-		// Ctrl+Space at session start is harmless; missing every real switch
-		// is not.
-		guard lang != lastLanguage else { return }
-		lastLanguage = lang
-		hasSeenInitialLanguage = true
-		// Short debounce ONLY to coalesce iPadOS double-notification glitches
-		// — 50 ms is well under any human switching cadence.
 		let now = CACurrentMediaTime()
+		let focusChange = now - lastFocusAt < 0.5
+		Diagnostics.note("layout-sync event=notification lang=\(lang ?? "nil") last=\(lastLanguage ?? "nil") focusChange=\(focusChange) fieldFirstResponder=\(hiddenField?.isFirstResponder ?? false)")
+		guard let lang else { return }
+		defer { lastLanguage = lang }
+		guard Self.shouldSendHostSwitch(
+			language: lang,
+			last: lastLanguage,
+			sinceFocus: now - lastFocusAt
+		) else { return }
+		// Coalesce iPadOS double notifications.
 		guard now - lastHotkeyAt > 0.05 else { return }
 		lastHotkeyAt = now
 		onLanguageChange?(lang)
+	}
+
+	/// Only a switch between two known languages, away from any focus move,
+	/// is a user's Globe/Caps switch.
+	static func shouldSendHostSwitch(language: String?, last: String?, sinceFocus: CFTimeInterval) -> Bool {
+		guard let language, let last, sinceFocus >= 0.5 else { return false }
+		return language != last
+	}
+
+	// Called on every focus move: suppress firing briefly and re-seed the
+	// known language once iPadOS has settled the new responder.
+	private func noteFocusChange() {
+		lastFocusAt = CACurrentMediaTime()
+		DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+			guard let self, let lang = self.hiddenField?.textInputMode?.primaryLanguage else { return }
+			self.lastLanguage = lang
+		}
 	}
 
 	// Prefer the mode advertised by the notification, fall back to whatever

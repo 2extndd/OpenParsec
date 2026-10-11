@@ -37,6 +37,22 @@ struct ContentView:View
 
 	func initApp()
 	{
+		if OpenParsecRuntime.isUITesting {
+			if let pointerMode = OpenParsecRuntime.pointerPresentationModeOverride {
+				SettingsHandler.pointerPresentationMode = pointerMode
+			}
+			if let showMacShortcuts = OpenParsecRuntime.macShortcutButtonsOverride {
+				SettingsHandler.hostShortcutToolbarMode = showMacShortcuts
+					? .both
+					: .windows
+			}
+			if let windowsMode = OpenParsecRuntime.windowsKeyboardModeOverride {
+				SettingsHandler.windowsKeyboardMode = windowsMode
+			}
+			CParsec.initialize()
+			curView = .main
+			return
+		}
 
 		// Check to see if we have old session data
 		if let data = loadFromKeychain(key: GLBDataModel.shared.SessionKeyChainKey)
@@ -81,7 +97,9 @@ struct ContentView:View
 
 	public func setView(_ t:ViewType)
 	{
-		withAnimation(.easeInOut) { curView = t }
+		withAnimation(.easeInOut) {
+			curView = t
+		}
 	}
 }
 
