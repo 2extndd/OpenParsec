@@ -727,9 +727,10 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		// Otherwise GLK autoresizing can publish portrait/ultrawide dimensions
 		// to the SDK while the app is leaving the foreground.
 		glkView?.cleanUp()
-		// Pause host video; the stream itself is stopped only if the app really
-		// goes to the background (SceneDelegate.sceneDidEnterBackground).
-		CParsec.setVideoSuspended(true)
+		// Video keeps flowing while merely inactive (Control Center, alerts):
+		// VideoToolbox stays valid, and a pause would cost a keyframe on return
+		// (1–2 s of stutter on a slow link). It is stopped only on a real
+		// background (SceneDelegate.sceneDidEnterBackground).
 		// keyboardWillHide fires while backgrounding; remember the user's choice.
 		keyboardWasVisibleBeforeResign = keyboardVisible
 	}

@@ -682,11 +682,9 @@ class ParsecSDKBridge: ParsecService
 		ParsecClientSetConfig(_parsec, &parsecClientCfg);
 	}
 
-	/// `stopStream: false` (resign-active: Control Center, notification shade,
-	/// app-switcher peek, system alerts): only pause the host. VideoToolbox
-	/// stays valid, the renderer keeps the last frame, and unpausing makes the
-	/// host send a keyframe — nothing to recover.
-	/// `stopStream: true` (really backgrounded): also disable the stream so
+	/// Called only for a real background (`stopStream: true`) and on return;
+	/// resign-active alone keeps the video running.
+	/// `stopStream: true`: pause and also disable the stream so
 	/// nothing reaches a decoder iPadOS invalidates. EnableStream(false) also
 	/// destroys the SDK's GL renderer (same body as ParsecClientGLDestroy,
 	/// 0x7a884), so this is reserved for the background.
@@ -709,7 +707,14 @@ class ParsecSDKBridge: ParsecService
 				// decode thread. A disabled stream delivers nothing.
 				streamStopped = true
 				let disable = RemoteStatus(ParsecClientEnableStream(_parsec, UInt8(DEFAULT_STREAM), false))
-				Diagnostics.note("video-pause event=stop stream=\(disable.rawValue)")
+				// Frames already in flight (seconds of them on a slow link; device
+				// log 16:09:24 decoded one 1 s after the disable) must not reach
+				// VideoToolbox: a config change makes decode_thread drop its
+				// decoder and skip everything until a keyframe, which the
+				// disabled stream does not send. The resume flips it back.
+				decoderFlipped.toggle()
+				applyConfig()
+				Diagnostics.note("video-pause event=stop stream=\(disable.rawValue) decoder=parked")
 			}
 			return
 		}
