@@ -1254,6 +1254,12 @@ final class ParsecConnectRunner {
 			let elapsed = String(format: "%.1f", Date().timeIntervalSince(startedAt))
 			if status == .ok {
 				Diagnostics.note("connect-ok generation=\(generation) try=\(index) elapsed=\(elapsed)s")
+				// Connected while backgrounded (attempt began inactive): re-assert
+				// the video stop now that a host session exists, and the grace cap.
+				if UIApplication.shared.applicationState == .background {
+					CParsec.setVideoSuspended(true, stopStream: true)
+					ParsecBackgroundManager.shared.beginBackgroundGrace()
+				}
 				completion(status)
 				return
 			}

@@ -41,6 +41,8 @@ class ParsecSDKBridge: ParsecService
 	private var videoSuspended = false
 	private var decoderFlipped = false
 	private var streamStopped = false
+	// Last measured RTT (ms), for retry pacing on slow links.
+	private var lastRttMs: Float = 0
 	private var videoResume: (at: CFAbsoluteTime, decodeLatency: Float, nudged: Bool)?
 	// Pollers and the input gate share one condition. A reconnect must drain
 	// both SDK poll calls before ParsecClientDisconnect and cannot start a new
@@ -320,6 +322,7 @@ class ParsecSDKBridge: ParsecService
 		let metrics = sdkStatus.`self`.metrics.0
 		self.hostHeight = Float(decoder.height)
 		self.hostWidth = Float(decoder.width)
+		lastRttMs = metrics.networkLatency.isFinite ? metrics.networkLatency : 0
 
 		return RemoteClientStatus(
 			status: checkVideoResume(RemoteStatus(result), decodeLatency: metrics.decodeLatency, rttMs: metrics.networkLatency),
@@ -695,18 +698,22 @@ class ParsecSDKBridge: ParsecService
 			return
 		}
 		if suspended {
-			if !videoSuspended {
-				videoSuspended = true
-				videoResume = nil
-				let pause = RemoteStatus(ParsecClientPause(_parsec, true, false))
-				Diagnostics.note("video-pause event=suspend result=\(pause.rawValue)")
-			}
-			if stopStream && !streamStopped {
+			// Pause/disable are re-sent on every call (idempotent host messages):
+			// a call made while the connect was still in progress may not have
+			// reached a host session yet, so connect-ok in the background re-asserts.
+			videoSuspended = true
+			videoResume = nil
+			let pause = RemoteStatus(ParsecClientPause(_parsec, true, false))
+			Diagnostics.note("video-pause event=suspend result=\(pause.rawValue)")
+			if stopStream {
 				// Device log 12:51:26: Pause alone did not stop the macOS host;
 				// a frame decoded in the background → vt_callback -14 → dead
 				// decode thread. A disabled stream delivers nothing.
-				streamStopped = true
 				let disable = RemoteStatus(ParsecClientEnableStream(_parsec, UInt8(DEFAULT_STREAM), false))
+				Diagnostics.note("video-pause event=stop stream=\(disable.rawValue)")
+			}
+			if stopStream && !streamStopped {
+				streamStopped = true
 				// Frames already in flight (seconds of them on a slow link; device
 				// log 16:09:24 decoded one 1 s after the disable) must not reach
 				// VideoToolbox: a config change makes decode_thread drop its
@@ -714,7 +721,7 @@ class ParsecSDKBridge: ParsecService
 				// disabled stream does not send. The resume flips it back.
 				decoderFlipped.toggle()
 				applyConfig()
-				Diagnostics.note("video-pause event=stop stream=\(disable.rawValue) decoder=parked")
+				Diagnostics.note("video-pause event=park-decoder")
 			}
 			return
 		}
@@ -1187,7 +1194,10 @@ class ParsecSDKBridge: ParsecService
 			}
 			return
 		}
-		DispatchQueue.global().asyncAfter(deadline: .now() + delays[attempt]) { [weak self] in
+		// On a slow link (device log: 6 s RTT) fixed 0.35–2.5 s retries fired
+		// before the first echo could arrive: 5 encoder re-inits for one switch.
+		let delay = max(delays[attempt], 1.5 * Double(lastRttMs) / 1000)
+		DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
 			guard let self = self, self.backgroundTaskRunning, self.configRevision == revision else { return }
 			// pendingOutput is mutated on the main queue (set in updateHostVideoConfig,
 			// cleared by the case-11 confirmation echo). It's a String?, not an atomic

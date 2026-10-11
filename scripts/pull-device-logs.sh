@@ -12,7 +12,8 @@ xcrun devicectl device copy from --device "$DEVICE" --domain-type appDataContain
   --domain-identifier "$BUNDLE" --source Documents --destination "$OUT" >/dev/null
 xcrun devicectl device copy from --device "$DEVICE" --domain-type systemCrashLogs \
   --source . --destination "$OUT/system" >/dev/null 2>&1 || true
-find "$OUT/system" -type f ! -iname '*OpenParsec*' -delete 2>/dev/null || true
+# Keep our crash reports plus any Jetsam/watchdog report that mentions the app.
+find "$OUT/system" -type f ! -iname '*OpenParsec*' ! -exec grep -q OpenParsec {} \; -delete 2>/dev/null || true
 echo "logs: $OUT"
 ls -la "$OUT"
 if [[ -f "$OUT/diagnostics.log" ]]; then

@@ -260,6 +260,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate
 		// failures during the rest of launch too.
 		CrashReporter.install()
 		Diagnostics.trimIfNeeded()
+		// Marks every process start, so a silent end (force-quit, jetsam) shows
+		// as a gap followed by this line instead of looking like a hang.
+		let info = Bundle.main.infoDictionary
+		Diagnostics.note("app-launch version=\(info?["CFBundleShortVersionString"] ?? "?") build=\(info?["CFBundleVersion"] ?? "?") crashLog=\(CrashReporter.peek() != nil)")
 		NetworkPathObserver.start()
 		// Q1: repair the hideStatusBar / cursorScale shared-key corruption
 		// before any UI reads these settings.
@@ -307,6 +311,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate
 	{
 		// Close the host session now; otherwise the host keeps a ghost
 		// session (and its bandwidth) for ~60 s until it times out.
+		Diagnostics.note("app-terminate")
 		CParsec.disconnect(reason: .user)
 		CParsec.destroy()
 	}
