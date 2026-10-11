@@ -46,7 +46,12 @@ session_active() {
 if [[ $FORCE == 0 ]] && why=$(session_active); then say "skip: Parsec session in progress ($why)"; exit 0; fi
 # Never ship a half-edited working tree to the iPad unattended.
 if [[ $FORCE == 0 ]] && ! git diff --quiet HEAD -- OpenParsec OpenParsec.xcodeproj 2>/dev/null; then
-  say "skip: uncommitted changes in the app sources"; exit 0
+  say "skip: uncommitted changes in the app sources"
+  # Don't let a forgotten dirty tree run the signing out silently.
+  if (( ${left_h:-999} < 48 )); then
+    osascript -e "display notification \"Signing expires in ${left_h}h; reinstall skipped (uncommitted changes)\" with title \"OpenParsec reinstall\"" 2>/dev/null || true
+  fi
+  exit 0
 fi
 if ! xcrun devicectl list devices 2>/dev/null | grep -F "$DEVICE" | grep -v unavailable | grep -qE "available|connected"; then
   say "skip: ${DEVICE} not reachable"; exit 0

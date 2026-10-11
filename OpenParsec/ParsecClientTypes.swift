@@ -882,6 +882,8 @@ enum ParsecVideoSuspendPolicy {
     /// ponytail: raised to 30 at the user's request (2026-10-12): untested
     /// between 20 and 40; drop back to 20 if the 0x724f4 crash reappears.
     static let maxSafeHostBitrate = 30
+    /// Ceiling once a session shows heavy packet loss (no crash seen at 20).
+    static let lossyLinkBitrate = 20
 
     static func safeHostBitrate(_ requested: Int) -> Int {
         requested > 0 ? min(requested, maxSafeHostBitrate) : requested

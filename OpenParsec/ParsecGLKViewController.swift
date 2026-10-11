@@ -47,9 +47,16 @@ class ParsecGLKViewController : ParsecPlayground {
 		glkRenderer = ParsecGLKRenderer(glkView, glkViewController, updateImage)
 		self.viewController.view.addSubview(glkView)
 		setupGLKViewController()
-		
-
+		thermalObserver = NotificationCenter.default.addObserver(
+			forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: .main
+		) { [weak self] _ in
+			Diagnostics.note("thermal state=\(ProcessInfo.processInfo.thermalState.rawValue)")
+			self?.applyPreferredFrameRate()
+		}
 	}
+
+	private var thermalObserver: NSObjectProtocol?
+	deinit { thermalObserver.map(NotificationCenter.default.removeObserver) }
 
 	private func setupGLKViewController() {
 		glkView.context = EAGLContext(api: .openGLES3)!
@@ -122,10 +129,11 @@ class ParsecGLKViewController : ParsecPlayground {
 	}
 
 	func applyPreferredFrameRate() {
-		let fps = SettingsHandler.preferredFramesPerSecond
-		glkViewController.preferredFramesPerSecond = fps == 0
-			? Int(UIScreen.main.maximumFramesPerSecond)
-			: fps
+		let setting = SettingsHandler.preferredFramesPerSecond
+		let fps = setting == 0 ? Int(UIScreen.main.maximumFramesPerSecond) : setting
+		// Hot iPad: the host sends ≤60 fps anyway; 120 Hz redraws only add heat.
+		let hot = ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue
+		glkViewController.preferredFramesPerSecond = hot ? min(fps, 60) : fps
 	}
 
 	func updateSize(width: CGFloat, height: CGFloat) {

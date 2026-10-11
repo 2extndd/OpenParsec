@@ -43,6 +43,12 @@ class ParsecSDKBridge: ParsecService
 	private var streamStopped = false
 	// Last measured RTT (ms), for retry pacing on slow links.
 	private var lastRttMs: Float = 0
+	// Bumped by disconnect: queued paste taps from before it are dropped.
+	private var keyEpoch = 0
+	// Heavy loss → cap at 20 for the rest of the session: the SDK reassembly
+	// crash (ParsecVideoSuspendPolicy.maxSafeHostBitrate) correlates with loss.
+	private var lossCapped = false
+	private var lossWindow: (at: CFAbsoluteTime, slowRTs: UInt32)?
 	private var videoResume: (at: CFAbsoluteTime, decodeLatency: Float, nudged: Bool)?
 	// Pollers and the input gate share one condition. A reconnect must drain
 	// both SDK poll calls before ParsecClientDisconnect and cannot start a new
@@ -69,6 +75,12 @@ class ParsecSDKBridge: ParsecService
 		return isPolling
 	}
 	var didSetResolution = false
+	// Last pushed payload + time: an identical push within a few seconds only
+	// restarts the host encoder again (device log: 2 identical pushes per connect).
+	private var lastPush: (data: Data, at: Date)?
+	// Re-assert the user's bitrate cap at most this often when the host echoes
+	// another value on its own (e.g. its own limit was changed).
+	private var lastBitrateReassert = Date.distantPast
 	// Restored once per session in handleUserDataEvent case 12 so display
 	// hot-plug / sleep-wake echoes don't keep re-firing updateHostVideoConfig
 	// and causing momentary re-encode flicker.
@@ -225,6 +237,9 @@ class ParsecSDKBridge: ParsecService
 		// silently never re-run.
 		didRestoreSavedDisplay = false
 		didSetResolution = false
+		lastPush = nil
+		lossCapped = false
+		lossWindow = nil
 		hostOSValue = -1
 		DispatchQueue.main.async { DataManager.model.hostOS = -1 }
 		// DataManager.model outlives sessions. Another host's display id/list
@@ -280,10 +295,11 @@ class ParsecSDKBridge: ParsecService
 
 		resetMediaReadiness()
 		videoResume = nil
-		stopBackgroundTaskAndWait()
-		// Flush queued key events (releases from releaseAll) before the SDK
-		// disconnect; a queued paste stops itself (generation changed).
+		// Flush queued key events (releases from releaseAll) while the session
+		// still accepts sends; a queued paste is cancelled, not typed out.
+		keyEpoch &+= 1
 		virtualKeyQueue.sync {}
+		stopBackgroundTaskAndWait()
 		audioWanted = false
 		// setActive can block 10–100+ ms: off the main thread, on the same
 		// serial queue as activateAudio() so a quick reconnect's activation
@@ -326,6 +342,7 @@ class ParsecSDKBridge: ParsecService
 		self.hostHeight = Float(decoder.height)
 		self.hostWidth = Float(decoder.width)
 		lastRttMs = metrics.networkLatency.isFinite ? metrics.networkLatency : 0
+		noteLoss(slowRTs: metrics.slowRTs)
 
 		return RemoteClientStatus(
 			status: checkVideoResume(RemoteStatus(result), decodeLatency: metrics.decodeLatency, rttMs: metrics.networkLatency),
@@ -476,6 +493,19 @@ class ParsecSDKBridge: ParsecService
 							&& videoConfig.fullFPS == pending.constantFps {
 							self.pendingUserConfig = nil
 						}
+					} else if SettingsHandler.bitrate > 0 && self.didSetResolution {
+						// The user set a cap: keep it. A different unsolicited echo
+						// (host limit changed on the Mac) is re-asserted, rate-limited,
+						// instead of silently adopting e.g. 50 over the user's 3.
+						let wanted = self.hostBitrate(SettingsHandler.bitrate)
+						DataManager.model.bitrate = SettingsHandler.bitrate
+						if videoConfig.encoderMaxBitrate != wanted,
+						   Date().timeIntervalSince(self.lastBitrateReassert) > 10 {
+							self.lastBitrateReassert = Date()
+							Diagnostics.note("video-config event=reassert bitrate=\(wanted) host=\(videoConfig.encoderMaxBitrate)")
+							self.updateHostVideoConfig()
+						}
+						DataManager.model.constantFps = videoConfig.fullFPS
 					} else {
 						DataManager.model.bitrate = videoConfig.encoderMaxBitrate
 						// Not on a session's first echo: that fullFPS is the host
@@ -523,6 +553,12 @@ class ParsecSDKBridge: ParsecService
 						if SettingsHandler.bitrate > 0 {
 							DataManager.model.bitrate = SettingsHandler.bitrate
 							Diagnostics.note("setting-apply id=bitrate mode=reconnect result=applied")
+						}
+						// Auto: keep the display the host already streams. Pushing
+						// "none" made the host re-init capture (and switch again on
+						// the saved-display restore): 3 encoder inits per connect.
+						if DataManager.model.output == "none", !videoConfig.output.isEmpty {
+							DataManager.model.output = videoConfig.output
 						}
 						self.updateHostVideoConfig()
 					}
@@ -937,11 +973,12 @@ class ParsecSDKBridge: ParsecService
 		pollCondition.lock()
 		let generation = pollGeneration
 		pollCondition.unlock()
+		let epoch = keyEpoch
 		virtualKeyQueue.async {
-			guard self.shouldPoll(generation: generation) else { return }
+			guard self.shouldPoll(generation: generation), self.keyEpoch == epoch else { return }
 			taps.filter { $0.pressed }.forEach(send)
 			usleep(20_000)
-			guard self.shouldPoll(generation: generation) else { return }
+			guard self.shouldPoll(generation: generation), self.keyEpoch == epoch else { return }
 			taps.filter { !$0.pressed }.forEach(send)
 		}
 	}
@@ -976,6 +1013,26 @@ class ParsecSDKBridge: ParsecService
 				Diagnostics.note("input-release-failed status=\(sent.rawValue)")
 			}
 		}
+	}
+
+	private func noteLoss(slowRTs: UInt32) {
+		let now = CFAbsoluteTimeGetCurrent()
+		guard let window = lossWindow, slowRTs >= window.slowRTs else {
+			lossWindow = (now, slowRTs); return
+		}
+		guard now - window.at >= 5 else { return }
+		let lost = slowRTs - window.slowRTs
+		lossWindow = (now, slowRTs)
+		guard !lossCapped, lost >= 30,
+			  ParsecVideoSuspendPolicy.safeHostBitrate(DataManager.model.bitrate) > ParsecVideoSuspendPolicy.lossyLinkBitrate else { return }
+		lossCapped = true
+		Diagnostics.note("video-config event=loss-cap slowRTs=\(lost)/5s bitrate=\(ParsecVideoSuspendPolicy.lossyLinkBitrate)")
+		DispatchQueue.main.async { self.updateHostVideoConfig() }
+	}
+
+	private func hostBitrate(_ requested: Int) -> Int {
+		let safe = ParsecVideoSuspendPolicy.safeHostBitrate(requested)
+		return lossCapped && safe > 0 ? min(safe, ParsecVideoSuspendPolicy.lossyLinkBitrate) : safe
 	}
 
 	/// Spaces out the events of a synthetic chord. Sent in the same instant,
@@ -1124,12 +1181,17 @@ class ParsecSDKBridge: ParsecService
 		// Clamp at the one point bitrate reaches the host encoder: above
 		// maxSafeHostBitrate the host's large H.265 keyframes overflow the SDK's
 		// BUD reassembler and crash decode_thread (see ParsecVideoSuspendPolicy).
-		let safeBitrate = ParsecVideoSuspendPolicy.safeHostBitrate(DataManager.model.bitrate)
+		let safeBitrate = hostBitrate(DataManager.model.bitrate)
 		videoConfig.video[0].encoderMaxBitrate = safeBitrate
 		videoConfig.video[0].fullFPS = DataManager.model.constantFps
 		videoConfig.video[0].output = DataManager.model.output
 		let encoder = JSONEncoder()
 		let data = try! encoder.encode(videoConfig)
+		if let last = lastPush, last.data == data, Date().timeIntervalSince(last.at) < 3 {
+			Diagnostics.note("video-config event=push-skipped reason=identical")
+			return
+		}
+		lastPush = (data, Date())
 
 		// S06: bump the revision so any in-flight resend from a previous call
 		// drops, and record the user-owned fields so the case-11 echo confirms
@@ -1198,7 +1260,7 @@ class ParsecSDKBridge: ParsecService
 	// idempotent (same output reapplied is a no-op once it's the active display),
 	// so over-asserting is harmless; under-asserting was the bug.
 	private func scheduleDisplaySwitchRetry(revision: Int, data: Data, attempt: Int) {
-		let delays: [Double] = [0.35, 0.8, 1.5, 2.5]
+		let delays: [Double] = [0.8, 1.5, 2.5, 4.0]  // host confirm takes ~0.4 s even on a good link
 		guard attempt < delays.count else {
 			// Give up re-asserting; drop the guard so a host that never echoes a
 			// matching output can't leave it pending forever.
@@ -1211,7 +1273,7 @@ class ParsecSDKBridge: ParsecService
 		}
 		// On a slow link (device log: 6 s RTT) fixed 0.35–2.5 s retries fired
 		// before the first echo could arrive: 5 encoder re-inits for one switch.
-		let delay = max(delays[attempt], 1.5 * Double(lastRttMs) / 1000)
+		let delay = max(delays[attempt], 3 * Double(lastRttMs) / 1000)
 		DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
 			guard let self = self, self.backgroundTaskRunning, self.configRevision == revision else { return }
 			// pendingOutput is mutated on the main queue (set in updateHostVideoConfig,

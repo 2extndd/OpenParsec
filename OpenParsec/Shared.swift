@@ -37,7 +37,9 @@ enum OpenParsecRuntime {
 	}
 
 	static var backgroundReconnectDelay: TimeInterval {
-		guard isUITesting else { return 0.5 }
+		// Short: most reconnects are a dead decoder after a background, with a
+		// healthy network — every 100 ms here is 100 ms of frozen picture.
+		guard isUITesting else { return 0.15 }
 		return timeIntervalArgument("--background-reconnect-delay=") ?? 0.5
 	}
 

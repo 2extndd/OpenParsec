@@ -147,6 +147,9 @@ struct ParsecStatusBar : View {
 		let running = ParsecConnectRunner.shared.isRunning
 		if isReconnecting != running { isReconnecting = running }
 		if running { return }
+		// A reconnect is already scheduled: polling the old, disconnected session
+		// would flip it to failed and make connect() disconnect the SDK twice.
+		if ParsecBackgroundManager.shared.isMarkedForReconnect { return }
 		
 		let generation = CParsec.sessionSnapshot.generation
 		let clientStatus = CParsec.getStatusEx(generation: generation)
