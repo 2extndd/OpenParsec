@@ -256,7 +256,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate
 			// Clipboard) and print it for any attached console. The file is
 			// kept (not consumed) so the Settings "Copy Last Crash Log" row
 			// can re-surface it later.
-			UIPasteboard.general.string = crash
+			// Only once per crash: later launches must not keep overwriting the
+			// user's clipboard (Universal Clipboard pushes it to the Mac too).
+			let flag = "crashLogCopiedFor"
+			if UserDefaults.standard.string(forKey: flag) != crash {
+				UIPasteboard.general.string = crash
+				UserDefaults.standard.set(crash, forKey: flag)
+			}
 			print("[OpenParsec] Recovered crash log from previous run:\n\(crash)")
 		}
 
@@ -281,6 +287,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate
 
 	func applicationWillTerminate(_ application: UIApplication)
 	{
+		// Close the host session now; otherwise the host keeps a ghost
+		// session (and its bandwidth) for ~60 s until it times out.
+		CParsec.disconnect(reason: .user)
 		CParsec.destroy()
 	}
 }

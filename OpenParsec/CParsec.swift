@@ -170,7 +170,8 @@ enum ParsecResolution: String, CaseIterable, Hashable {
 		return Array(Self.allCases)
 	}
 
-	static var bitrates = [3, 5, 7, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+	// Capped at ParsecVideoSuspendPolicy.maxSafeHostBitrate (SDK reassembly crash above it).
+	static var bitrates = [3, 5, 7, 10, 15, 20]
 
 	static func updateClientResolution(width: Int, height: Int) {
 		// Encoders need even dimensions (the view is 2421 px wide at 1.7196x).
@@ -590,6 +591,14 @@ class CParsec
 			generation: attempt.generation
 		)
 		let initiationStatus = parsecImpl.connect(peerID)
+		// A retry/reconnect can complete while the app is already backgrounded:
+		// no sceneDidEnterBackground follows, so suspend video (no decoding in
+		// the background → no -14) and start the background grace cap here.
+		if (initiationStatus == .ok || initiationStatus == .connecting),
+		   UIApplication.shared.applicationState == .background {
+			parsecImpl.setVideoSuspended(true)
+			ParsecBackgroundManager.shared.beginBackgroundGrace()
+		}
 		// ParsecClientConnect is asynchronous: PARSEC_OK means only that the
 		// attempt was accepted, not that the transport is usable. Publishing
 		// `.ok` here races generation-scoped setup (dimensions, host config,

@@ -740,7 +740,9 @@ class ParsecSDKBridge: ParsecService
 		case .stalled:
 			videoResume = nil
 			Diagnostics.note("decoder-recovery event=stalled ms=\(ms) action=reconnect")
-			return RemoteStatus(rawValue: -14)
+			// Only stand in for a missing frame; a real error keeps its code
+			// (and its proper alert / transport handling).
+			return status == .ok ? RemoteStatus(rawValue: -14) : status
 		}
 	}
 	

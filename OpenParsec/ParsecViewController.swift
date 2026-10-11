@@ -841,8 +841,9 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 			parent.setChildViewControllerForPointerLock(nil)
 			parent.setChildForScreenEdgesDeferringSystemGestures(nil)
 		}
-		NotificationCenter.default.removeObserver(self, name: UIResponder.keyboardWillShowNotification, object: nil)
-		NotificationCenter.default.removeObserver(self, name: UIResponder.keyboardWillHideNotification, object: nil)
+		// Keyboard observers stay: they are added once in viewDidLoad, and the
+		// same controller can reappear (removing them here broke the hidden
+		// field's refocus → language sync after any disappear/appear cycle).
 		stopLanguageSync()
 		stopScrollMomentum()
 	}

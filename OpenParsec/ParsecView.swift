@@ -211,9 +211,11 @@ struct ParsecStatusBar : View {
 				}
 			case let .terminal(_, terminalStatus):
 				wasDisconnected = true
-				DCAlertText = Self.disconnectMessage(
-					forCode: Int(terminalStatus.rawValue)
-				)
+				// -3 only says "not running"; the session keeps the real cause.
+				let code = terminalStatus.rawValue == -3
+					? CParsec.sessionSnapshot.lastFailure?.rawCode ?? terminalStatus.rawValue
+					: terminalStatus.rawValue
+				DCAlertText = Self.disconnectMessage(forCode: Int(code))
 				showDCAlert = true
 			case nil:
 				break
