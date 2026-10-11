@@ -324,11 +324,17 @@ final class OpenParsecUITests: XCTestCase {
             in: app,
             timeout: 10
         )
-        assertElement(
-            "openparsec.keyboard.diagnostics",
-            hasLabel: "generation=1 pressed=0 repeats=0 release=background",
-            in: app,
-            timeout: 10
+        // Leaving the foreground releases the key; whether focus loss or the
+        // background transition gets there first depends on the runner.
+        let diagnostics = app.descendants(matching: .any)["openparsec.keyboard.diagnostics"]
+        let released = NSPredicate(
+            format: "label MATCHES %@",
+            "generation=1 pressed=0 repeats=0 release=(background|focus-lost)"
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: released, object: diagnostics)], timeout: 10),
+            .completed,
+            "Expected the held key released on leaving foreground, got \(diagnostics.label)"
         )
     }
 
