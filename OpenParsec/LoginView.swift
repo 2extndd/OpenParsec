@@ -199,55 +199,70 @@ struct LoginView:View
 
 					if statusCode == 201 // 201 Created
 					{
-						// store it and recover it from the next app opening, so people won't swear
-						NetworkHandler.clinfo = try? decoder.decode(ClientInfo.self, from:data)
+						guard let clientInfo = try? decoder.decode(ClientInfo.self, from: data) else {
+							let failure = ParsecAPIResponseClassifier.classify(
+								endpoint: .authentication,
+								statusCode: statusCode,
+								transportFailed: false,
+								decodedSuccessfully: false
+							)
+							alertText = failure?.message ?? "Parsec returned an invalid response. Try again."
+							showAlert = true
+							return
+						}
 
+						NetworkHandler.clinfo = clientInfo
 						saveToKeychain(data: data, key: GLBDataModel.shared.SessionKeyChainKey)
 
 						if let c = controller
 						{
-							print("*** Login succeeded! ***")
 							c.setView(.main)
 						}
 					}
-					else if statusCode >= 400 // 4XX client errors
+					else // Any response other than the expected 201 is a classified failure
 					{
-						guard let info = try? decoder.decode(ErrorInfo.self, from:data) else
-						{
-							alertText = "Login failed (HTTP \(statusCode))."
-							showAlert = true
-							return
-						}
+						let failure = ParsecAPIResponseClassifier.classify(
+							endpoint: .authentication,
+							statusCode: statusCode,
+							transportFailed: false,
+							decodedSuccessfully: false
+						)
+						let serverMessage = (try? decoder.decode(ErrorInfo.self, from: data))?.error
 
 						do
 						{
 							let json = try JSONSerialization.jsonObject(with: data, options: [])
 							if let dict = json as? [String: Any], let isTFARequired = dict["tfa_required"] as? Bool {
-								print("Code output:")
-								print(dict)
 								if isTFARequired
 								{
 									presentTFAAlert = true
 								}
 								else
 								{
-									alertText = "Error: \(info)"
+									alertText = serverMessage ?? failure?.message ?? "Sign-in failed."
 									showAlert = true
 								}
 							} else {
-								alertText = info.error
+								alertText = serverMessage ?? failure?.message ?? "Sign-in failed."
 								showAlert = true
 							}
 						}
 						catch
 						{
-							print("Error on trying JSON Serialization on error data!")
+							alertText = serverMessage ?? failure?.message ?? "Sign-in failed."
+							showAlert = true
 						}
 					}
 				}
 				else
 				{
-					alertText = "Network error. Check your connection and try again."
+					let failure = ParsecAPIResponseClassifier.classify(
+						endpoint: .authentication,
+						statusCode: nil,
+						transportFailed: true,
+						decodedSuccessfully: false
+					)
+					alertText = failure?.message ?? "Network unavailable. Try again."
 					showAlert = true
 				}
 			}

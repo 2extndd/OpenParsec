@@ -28,3 +28,8 @@ Temporary Items
 
 ## User settings
 xcuserdata/
+
+## Agent-local caches and local build outputs
+.bg-shell/
+.firecrawl/
+.build/

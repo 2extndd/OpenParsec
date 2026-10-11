@@ -1,55 +1,19 @@
+#if !targetEnvironment(simulator)
 import ParsecSDK
 import MetalKit
+import AVFoundation
 import UIKit
 import os
 
-enum RendererType: Int
-{
-	case opengl
-    case metal
-}
-
-enum DecoderPref: Int
-{
-    case h264
-    case h265
-}
-
-enum CursorMode: Int
-{
-    case touchpad
-    case direct
-}
-
-// Which hotkey to fire at the host when the iPad's hardware-keyboard input
-// language changes. Default: Ctrl+Space, the macOS built-in "select previous
-// input source" shortcut — works if the user has the same two layouts on the
-// host as on the iPad, in the same order. For other layout sets / OSes the
-// user can pick a different combination in Settings.
-enum LayoutSyncHotkey: Int, CaseIterable
-{
-    case none = 0
-    case ctrlSpace = 1
-    case cmdSpace = 2
-    case altSpace = 3
-    case altShift = 4
-    case ctrlShift = 5  // ⌃⇧ — another common macOS layout-toggle binding
-}
-
-enum RightClickPosition: Int
-{
-	case firstFinger
-	case middle
-	case secondFinger
-}
-
-struct KeyBoardKeyEvent {
-	var input: UIKey?
-	var isPressBegin: Bool
+private extension RemoteStatus {
+    init(_ status: ParsecStatus) {
+        self.init(rawValue: Int32(status.rawValue))
+    }
 }
 
 class ParsecSDKBridge: ParsecService
 {
+	let adapterKind: ParsecAdapterKind = .real
 	var hostWidth: Float = 1920
 	
 	var hostHeight: Float = 1080
@@ -60,6 +24,10 @@ class ParsecSDKBridge: ParsecService
 	private var _parsec: OpaquePointer!
 	private var _audio: OpaquePointer!
 	private let _audioPtr: UnsafeRawPointer
+	private var audioWanted = false
+	private let virtualKeyQueue = DispatchQueue(label: "openparsec.virtual-key-taps")
+	private let audioSessionQueue = DispatchQueue(label: "openparsec.audio-session")
+	private var audioObservers: [NSObjectProtocol] = []
 	
 	private var isVirtualShiftOn = false
 
@@ -69,18 +37,33 @@ class ParsecSDKBridge: ParsecService
 	public var netProtocol: Int32 = 1
 	public var mediaContainer: Int32 = 0
 	public var pngCursor: Bool = false
-	// Doubles as a gate for outgoing input messages: while false (between an
-	// explicit disconnect and the next connect, including the brief gap in
-	// changeResolution), every send* method below early-returns so we don't
-	// fire ParsecClientSendMessage into a disconnected client.
-	var backgroundTaskRunning = true
-	// C3 fix: monotonic token bumped on every startBackgroundTask(). Each poll
-	// loop captures the value at spawn and exits the instant the token moves,
-	// so a fast disconnect→reconnect (which the 0.02 s drain in disconnect()
-	// can't guarantee has fully drained) cannot leave two generations of
-	// audio/event loops running against one client and double-polling
-	// ParsecGetBuffer / ParsecFree.
-	private var pollGeneration: Int = 0
+	// See ParsecVideoSuspendPolicy. Guarded by CParsec.lifecycleLock.
+	private var videoSuspended = false
+	private var videoResume: (at: CFAbsoluteTime, decodeLatency: Float, nudged: Bool)?
+	// Pollers and the input gate share one condition. A reconnect must drain
+	// both SDK poll calls before ParsecClientDisconnect and cannot start a new
+	// pair until ParsecClientConnect has accepted the replacement session.
+	private let pollCondition = NSCondition()
+	private var isPolling = false
+	private var pollGeneration: UInt64 = 0
+	// Serialises input sends with ParsecClientDisconnect: a send that passed
+	// the polling check must finish before the client is torn down (the SDK
+	// makes no thread-safety promise for that overlap).
+	private let sendGate = NSLock()
+
+	@discardableResult
+	private func sendGated(_ message: inout ParsecMessage) -> ParsecStatus {
+		sendGate.lock()
+		defer { sendGate.unlock() }
+		guard backgroundTaskRunning else { return PARSEC_NOT_RUNNING }
+		return ParsecClientSendMessage(_parsec, &message)
+	}
+	private var activePollerCount = 0
+	private var backgroundTaskRunning: Bool {
+		pollCondition.lock()
+		defer { pollCondition.unlock() }
+		return isPolling
+	}
 	var didSetResolution = false
 	// Restored once per session in handleUserDataEvent case 12 so display
 	// hot-plug / sleep-wake echoes don't keep re-firing updateHostVideoConfig
@@ -98,6 +81,10 @@ class ParsecSDKBridge: ParsecService
 	// mutate under the same lock via `withMouseInfo`.
 	private var _mouseInfo = MouseInfo()
 	private var mouseInfoLock = os_unfair_lock_s()
+	private var _mediaEvidence = ParsecMediaEvidence.initial
+	private var mediaEvidenceLock = os_unfair_lock_s()
+	private let keyboardMappingLock = NSLock()
+	private var keyboardMappingLatch = ParsecKeyboardMappingLatch()
 
 	// S04: raw host-OS int mirror, written from the case-11 main block and read
 	// lock-free from input threads (plain Int load is atomic on-device). Reset
@@ -115,6 +102,21 @@ class ParsecSDKBridge: ParsecService
 	// token (benign plain-Int read, same pattern as backgroundTaskRunning).
 	private var configRevision: Int = 0
 	private var pendingUserConfig: (bitrate: Int, constantFps: Bool)? = nil
+	// The display id a switch is still trying to land. A single fire-and-forget
+	// setVideoConfig can be dropped while the host encoder is mid-reset from the
+	// switch — the reason a display change historically needed two or three taps
+	// (and why "select the current monitor, then the target" worked: it spaced
+	// two sends by a human delay). We keep re-asserting this output on a widening
+	// schedule until the case-11 echo reports it as the host's current output, or
+	// we hit the attempt cap. Cleared on the main thread; the retry closures read
+	// it lock-free (same benign-plain-read pattern as pendingUserConfig).
+	private var pendingOutput: String? = nil
+	// Output the host last echoed (main thread). Bitrate/FPS pushes still
+	// carry `output`, but only a real change runs the confirm/retry loop.
+	private var hostOutput: String? = nil
+	private var pendingOutputSince = Date() // diagnostics: switch→confirm latency
+	// Peer of the last connect(); a different host invalidates model.output.
+	private var lastSessionPeerID: String? = nil
 
 	// Atomic snapshot for cross-thread readers. Returns a consistent copy of
 	// the whole struct under the lock so `cursorImg`'s retain happens while no
@@ -135,48 +137,82 @@ class ParsecSDKBridge: ParsecService
 		return body(&_mouseInfo)
 	}
 
+	var mediaEvidence: ParsecMediaEvidence {
+		os_unfair_lock_lock(&mediaEvidenceLock)
+		defer { os_unfair_lock_unlock(&mediaEvidenceLock) }
+		return _mediaEvidence
+	}
+
+	var mediaReadiness: ParsecMediaReadiness {
+		mediaEvidence.readiness
+	}
+
+	private func updateMediaEvidence(_ body: (inout ParsecMediaEvidence) -> Void) {
+		os_unfair_lock_lock(&mediaEvidenceLock)
+		defer { os_unfair_lock_unlock(&mediaEvidenceLock) }
+		body(&_mediaEvidence)
+	}
+
+	private func resetMediaReadiness() {
+		updateMediaEvidence { $0 = .initial }
+	}
+
 	init() {
 		print("Parsec SDK Version: " + String(ParsecSDKBridge.PARSEC_VER))
 		
+		// The SDK log is the only source that explains NAT/-60xx failures, so
+		// persist non-debug lines to diagnostics instead of stdout only.
 		ParsecSetLogCallback(
 			{ (level, msg, opaque) in
-				print("[\(level == LOG_DEBUG ? "D" : "I")] \(String(cString:msg!))")
+				guard let msg else { return }
+				let line = String(cString: msg)
+				if level == LOG_DEBUG { print("[D] \(line)"); return }
+				Diagnostics.note("sdk-log \(line)")
 			}, nil)
 		
 		audio_init(&_audio)
 		
 		self._audioPtr = UnsafeRawPointer(_audio)
 		
-		do {
-			let reservedCfg = ["ssHost": "kessel-ws.parsec.app"]
-			let json = JSONEncoder()
-			try json.encode(reservedCfg).withUnsafeBytes { (jsonStrBPtr: UnsafeRawBufferPointer) in
-				guard let jsonStrPtr = jsonStrBPtr.baseAddress else {
+		// ParsecInit reads `reserved` as a NUL-terminated C string; the old
+		// JSONEncoder bytes had no terminator, so the SDK read past the buffer.
+		let initStatus = "{\"ssHost\":\"kessel-ws.parsec.app\"}".withCString {
+			ParsecInit(ParsecSDKBridge.PARSEC_VER, nil, $0, &_parsec)
+		}
+		Diagnostics.note("sdk-init result=\(initStatus.rawValue)")
+
+		// The system stops the AudioQueue on interruptions and invalidates it on a
+		// media-services reset; a silent host sends no packets to trigger the lazy
+		// restart in audio_cb, so re-arm explicitly at these points.
+		let center = NotificationCenter.default
+		for name in [AVAudioSession.interruptionNotification,
+					 AVAudioSession.mediaServicesWereResetNotification,
+					 UIApplication.didBecomeActiveNotification] {
+			audioObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+				guard let self, self.audioWanted else { return }
+				if note.name == AVAudioSession.interruptionNotification,
+				   (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) != AVAudioSession.InterruptionType.ended.rawValue {
 					return
 				}
-				ParsecInit(ParsecSDKBridge.PARSEC_VER, nil, jsonStrPtr, &_parsec)
-			}
-
-		} catch {
-			print("error: \(error)")
+				Diagnostics.note("audio-rearm reason=\(note.name.rawValue)")
+				if note.name == AVAudioSession.mediaServicesWereResetNotification {
+					audio_clear(&self._audio)
+				}
+				self.activateAudio()
+			})
 		}
 
 	}
 	
 	deinit {
+		stopBackgroundTaskAndWait()
 		ParsecDestroy(_parsec)
 		audio_destroy(&_audio)
 	}
 	
-	func connect(_ peerID: String) -> ParsecStatus {
-		// CRITICAL: disconnect() set this to false to drain the poll loops.
-		// If we don't flip it back to true here, the new poll loops spawned
-		// by startBackgroundTask() below will read false on their first
-		// iteration and exit immediately — leaving the session with no audio
-		// callbacks, no cursor updates, and no user-data events for the rest
-		// of its lifetime. Also acts as the "sending allowed" gate for input
-		// messages, so flip it before any input could possibly fire.
-		backgroundTaskRunning = true
+	func connect(_ peerID: String) -> RemoteStatus {
+		resetMediaReadiness()
+		hostOutput = nil
 		// Every fresh connect() should attempt to restore the saved display
 		// when case-12 arrives. Resetting here (not only in disconnect()) is
 		// load-bearing — common reconnect paths (alert dismiss → reconnect,
@@ -187,6 +223,20 @@ class ParsecSDKBridge: ParsecService
 		didSetResolution = false
 		hostOSValue = -1
 		DispatchQueue.main.async { DataManager.model.hostOS = -1 }
+		// DataManager.model outlives sessions. Another host's display id/list
+		// must not ride the first-echo push (host would capture a missing
+		// output → black screen, then retry for ~5 s waiting on a confirm).
+		if peerID != lastSessionPeerID {
+			lastSessionPeerID = peerID
+			DispatchQueue.main.async {
+				DataManager.model.output = "none"
+				DataManager.model.displayConfigs = []
+			}
+		}
+
+		// A new decode_thread starts with a fresh decoder and an unpaused host.
+		videoSuspended = false
+		videoResume = nil
 
 		var parsecClientCfg = ParsecClientConfig()
 		parsecClientCfg.video.0.decoderIndex = 1
@@ -207,22 +257,41 @@ class ParsecSDKBridge: ParsecService
 		//parsecClientCfg.secret = ""
 		parsecClientCfg.pngCursor = false
 
-		self.startBackgroundTask()
-		
 		let status = ParsecClientConnect(_parsec, &parsecClientCfg, NetworkHandler.clinfo?.session_id, peerID)
-		
-		if status == PARSEC_OK || status == PARSEC_CONNECTING {
-			ParsecBackgroundManager.shared.connectionDidStart(peerId: peerID)
+		let remoteStatus = RemoteStatus(status)
+		if remoteStatus == .ok || remoteStatus == .connecting {
+			startBackgroundTask()
+			audioWanted = true
+			activateAudio()
 		}
-
-		return status
+		return remoteStatus
 	}
 	
 	func disconnect() {
 
-		audio_clear(&_audio)
+		resetMediaReadiness()
+		videoResume = nil
+		stopBackgroundTaskAndWait()
+		audioWanted = false
+		// setActive can block 10–100+ ms: off the main thread, on the same
+		// serial queue as activateAudio() so a quick reconnect's activation
+		// always lands after this deactivation.
+		// Clear on the same queue too: a pending activateAudio() (setActive can
+		// be slow) must not recreate the queue after this clear and keep a
+		// silent player alive after the session ended.
+		let audio = _audioPtr
+		audioSessionQueue.async {
+			var ctx: OpaquePointer? = OpaquePointer(audio)
+			audio_clear(&ctx)
+			try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+		}
+		// Waits for any input send that passed its gate before polling stopped.
+		sendGate.lock()
 		ParsecClientDisconnect(_parsec)
-		backgroundTaskRunning = false
+		sendGate.unlock()
+		keyboardMappingLock.lock()
+		keyboardMappingLatch.reset()
+		keyboardMappingLock.unlock()
 		// Reset so the next case-11 echo after a reconnect re-pushes our
 		// desired resolution instead of clobbering it with whatever the host
 		// happens to advertise.
@@ -231,34 +300,58 @@ class ParsecSDKBridge: ParsecService
 		hostOSValue = -1
 		DispatchQueue.main.async { DataManager.model.hostOS = -1 }
 
-		// Give the two `while backgroundTaskRunning` loops in
-		// startBackgroundTask() one full poll-timeout to notice the flag
-		// flip and exit. Without this drain, a fast reconnect() can spawn
-		// fresh loops while the old ones are still inside ParsecClientPollAudio
-		// / ParsecClientPollEvents, briefly doubling the poll rate and
-		// causing audio glitches.
-		Thread.sleep(forTimeInterval: 0.02)
-
-		ParsecBackgroundManager.shared.connectionDidEnd()
 	}
-	
-	func getStatus() -> ParsecStatus {
-		
-		return ParsecClientGetStatus(_parsec, nil)
-	}
-	
-	func getStatusEx(_ pcs:inout ParsecClientStatus) -> ParsecStatus {
-		let ans = ParsecClientGetStatus(_parsec, &pcs)
-		self.hostHeight = Float(pcs.decoder.0.height)
-		self.hostWidth = Float(pcs.decoder.0.width)
 
-		return ans;
+	func getStatus() -> RemoteStatus {
+		return RemoteStatus(ParsecClientGetStatus(_parsec, nil))
+	}
+
+	func getStatusEx() -> RemoteClientStatus {
+		var sdkStatus = ParsecClientStatus()
+		let result = ParsecClientGetStatus(_parsec, &sdkStatus)
+		let decoder = sdkStatus.decoder.0
+		let metrics = sdkStatus.`self`.metrics.0
+		self.hostHeight = Float(decoder.height)
+		self.hostWidth = Float(decoder.width)
+
+		return RemoteClientStatus(
+			status: checkVideoResume(RemoteStatus(result), decodeLatency: metrics.decodeLatency),
+			metrics: RemoteClientMetrics(
+				decodeLatency: Double(metrics.decodeLatency),
+				encodeLatency: Double(metrics.encodeLatency),
+				networkLatency: Double(metrics.networkLatency),
+				bitrate: Double(metrics.bitrate),
+				queuedFrames: metrics.queuedFrames,
+				fastRetransmits: metrics.fastRTs,
+				slowRetransmits: metrics.slowRTs
+			),
+			decoder: RemoteDecoderStatus(
+				name: String.fromBuffer(&sdkStatus.decoder.0.name.0, length: 16),
+				width: decoder.width,
+				height: decoder.height,
+				usesH265: decoder.h265,
+				usesColor444: decoder.color444
+			)
+		)
 	}
 	
 	func setFrame(_ width:CGFloat, _ height:CGFloat, _ scale: CGFloat) {
-		
-		ParsecClientSetDimensions(_parsec, UInt8(DEFAULT_STREAM), UInt32(width), UInt32(height), Float(scale))
-		
+		let sdkStatus = ParsecClientSetDimensions(
+			_parsec,
+			UInt8(DEFAULT_STREAM),
+			UInt32(width),
+			UInt32(height),
+			Float(scale)
+		)
+		// Successful calls are summarised once per settled change by
+		// ParsecViewController ("render-geometry event=settled").
+		if sdkStatus != PARSEC_OK {
+			Diagnostics.note(
+				"sdk-dimensions result=\(RemoteStatus(sdkStatus).rawValue) " +
+				"width=\(Int(width)) height=\(Int(height)) scale=\(scale)"
+			)
+		}
+
 		clientWidth = Float(width)
 		clientHeight = Float(height)
 		withMouseInfo {
@@ -268,9 +361,25 @@ class ParsecSDKBridge: ParsecService
 	}
 	
 	// timeout in ms, 16 == 60 FPS, 8 == 120 FPS, etc.
-	func renderGLFrame(timeout: UInt32 = 16) {
-		
-		ParsecClientGLRenderFrame(_parsec, UInt8(DEFAULT_STREAM), nil, nil, timeout)
+	func renderGLFrame(timeout: UInt32 = 16) -> ParsecRenderFrameResult {
+		let sdkStatus = ParsecClientGLRenderFrame(
+			_parsec,
+			UInt8(DEFAULT_STREAM),
+			nil, // pre-render fires on re-draws too: no new-frame signal (RenderClock)
+			nil,
+			timeout
+		)
+		let status = RemoteStatus(sdkStatus)
+		let producedFrame = sdkStatus == PARSEC_OK
+		updateMediaEvidence {
+			$0.videoStatus = status
+			if producedFrame {
+				$0.readiness.video = true
+			}
+		}
+		return producedFrame
+			? .produced(status: status)
+			: .noFrame(status: status)
 	}
 	
 	/*static func renderMetalFrame(_ queue:inout MTLCommandQueue, _ texturePtr: UnsafeMutablePointer<UnsafeMutableRawPointer?>, timeout: UInt32 = 16) // timeout in ms, 16 == 60 FPS, 8 == 120 FPS, etc.
@@ -280,7 +389,14 @@ class ParsecSDKBridge: ParsecService
 	
 	func pollAudio(timeout: UInt32 = 16) // timeout in ms, 16 == 60 FPS, 8 == 120 FPS, etc.
 	{
-		ParsecClientPollAudio(_parsec, audio_cb, timeout, _audioPtr)
+		let sdkStatus = ParsecClientPollAudio(_parsec, audio_cb, timeout, _audioPtr)
+		let status = RemoteStatus(sdkStatus)
+		updateMediaEvidence {
+			$0.audioStatus = status
+			if sdkStatus == PARSEC_OK {
+				$0.readiness.audio = true
+			}
+		}
 	}
 	
 	var getFirstCursor = false
@@ -308,14 +424,31 @@ class ParsecSDKBridge: ParsecService
 	func handleUserDataEvent(event: ParsecClientUserDataEvent) {
 		
 		let pointer = ParsecGetBuffer(_parsec, event.key)
+		// Guard a null buffer the same way handleCursorEvent does. Without this
+		// the decode paths below would crash the event poll thread on a null get;
+		// there is also nothing to ParsecFree.
+		guard let pointer else {
+			return
+		}
+		CParsec.recordBufferAcquired()
+		defer {
+			ParsecFree(pointer)
+			CParsec.recordBufferFreed()
+		}
 		switch event.id {
 		case 11:
 			do {
 				let decoder = JSONDecoder()
-				let config = try decoder.decode(ParsecUserDataVideoConfig.self, from: Data(bytesNoCopy: pointer!, count: strlen(pointer!), deallocator: .none))
-				let videoConfig = config.video[0]
+				let config = try decoder.decode(ParsecUserDataVideoConfig.self, from: Data(bytesNoCopy: pointer, count: strlen(pointer), deallocator: .none))
+				guard let videoConfig = config.video.first else { return }
 
 				DispatchQueue.main.async {
+					self.hostOutput = videoConfig.output
+					Diagnostics.note(
+						"video-config event=echo output=\(videoConfig.output) bitrate=\(videoConfig.encoderMaxBitrate) " +
+						"fullFPS=\(videoConfig.fullFPS) res=\(videoConfig.resolutionX)x\(videoConfig.resolutionY) " +
+						"pendingOutput=\(self.pendingOutput ?? "-") pendingUser=\(self.pendingUserConfig.map { "\($0.bitrate)/\($0.constantFps)" } ?? "-")"
+					)
 					// resolutionX/Y are host-authoritative — always adopt.
 					DataManager.model.resolutionX = videoConfig.resolutionX
 					DataManager.model.resolutionY = videoConfig.resolutionY
@@ -331,7 +464,23 @@ class ParsecSDKBridge: ParsecService
 						}
 					} else {
 						DataManager.model.bitrate = videoConfig.encoderMaxBitrate
-						DataManager.model.constantFps = videoConfig.fullFPS
+						// Not on a session's first echo: that fullFPS is the host
+						// default, and adopting it wiped the restored/in-session
+						// Constant FPS right before the one-shot push below sent it.
+						if self.didSetResolution { DataManager.model.constantFps = videoConfig.fullFPS }
+					}
+					// Confirm a display switch: once the host echoes the output we
+					// asked for, stop re-asserting it. We only READ the echoed
+					// output here (never write it back into model.output) so a
+					// host that omits/normalizes the field can't clobber the
+					// user's selection — same caution as the bitrate guard above.
+					if let pendingOut = self.pendingOutput, videoConfig.output == pendingOut {
+						self.pendingOutput = nil
+						Diagnostics.note("display-output event=confirmed output=\(pendingOut) ms=\(Int(Date().timeIntervalSince(self.pendingOutputSince) * 1000))")
+						NotificationCenter.default.post(
+							name: .parsecDisplayOutputDidConfirm,
+							object: nil
+						)
 					}
 					// S04: capture the host-OS int and log it once per session
 					// change so its undocumented encoding can be discovered
@@ -340,6 +489,9 @@ class ParsecSDKBridge: ParsecService
 						self.hostOSValue = videoConfig.hostOS
 						DataManager.model.hostOS = videoConfig.hostOS
 						Diagnostics.note("hostOS=\(videoConfig.hostOS) (resolution=\(videoConfig.resolutionX)x\(videoConfig.resolutionY), bitrate=\(videoConfig.encoderMaxBitrate))")
+						// The shortcut toolbar is built once; rebuild it for the
+						// now-known host (Automatic shows Mac or Windows keys).
+						SettingsHandler.notifyChanged(.hostShortcutToolbarMode)
 					}
 					if !self.didSetResolution {
 						self.didSetResolution = true
@@ -354,9 +506,9 @@ class ParsecSDKBridge: ParsecService
 						// would never take effect. Riding the existing one-shot
 						// push avoids a separate timer/race and leaves `output`
 						// untouched, so it can't clobber the restored display.
-						if SettingsHandler.lowLatencyMode && SettingsHandler.bitrate > 0 {
+						if SettingsHandler.bitrate > 0 {
 							DataManager.model.bitrate = SettingsHandler.bitrate
-							Diagnostics.note("S08 low-latency: capping bitrate to \(SettingsHandler.bitrate) Mbps (host reported \(videoConfig.encoderMaxBitrate))")
+							Diagnostics.note("setting-apply id=bitrate mode=reconnect result=applied")
 						}
 						self.updateHostVideoConfig()
 					}
@@ -368,9 +520,19 @@ class ParsecSDKBridge: ParsecService
 		case 12:
 			do {
 				let decoder = JSONDecoder()
-				let config = try decoder.decode(Array<ParsecDisplayConfig>.self, from: Data(bytesNoCopy: pointer!, count: strlen(pointer!), deallocator: .none))
+				let config = try decoder.decode(Array<ParsecDisplayConfig>.self, from: Data(bytesNoCopy: pointer, count: strlen(pointer), deallocator: .none))
 				DispatchQueue.main.async {
 					DataManager.model.displayConfigs = config
+					Diagnostics.note("display-list count=\(config.count) ids=\(config.map(\.id).joined(separator: ","))")
+					// A selection that isn't on this host (other host's id, or a
+					// display unplugged since) would be re-sent by every later
+					// bitrate/fps push and make the host capture a missing output.
+					let current = DataManager.model.output
+					if current != "none", !config.contains(where: { $0.id == current }) {
+						DataManager.model.output = "none"
+						self.pendingOutput = nil // stop re-asserting the missing id
+						Diagnostics.note("display-output event=stale-reset")
+					}
 					// Restore the saved display ONCE per session. The host
 					// can re-advertise its display list multiple times mid-
 					// stream (sleep/wake, display hot-plug); without this
@@ -380,18 +542,15 @@ class ParsecSDKBridge: ParsecService
 						self.didRestoreSavedDisplay = true
 						let savedId = SettingsHandler.savedDisplayOutput
 						let savedName = SettingsHandler.savedDisplayName
-						guard !savedId.isEmpty || !savedName.isEmpty else { return }
-						// Match by id first (stable when the host reports
-						// consistent display ids across sessions). Fall
-						// back to name+adapter match so a display that
-						// changed id between connects (Parsec sometimes
-						// regenerates them) is still found.
-						let match = config.first(where: { $0.id == savedId })
-							?? config.first(where: { !savedName.isEmpty && "\($0.name) \($0.adapterName)" == savedName })
-						if let match = match {
+						guard SettingsHandler.saveSessionSettings,
+							  !savedId.isEmpty || !savedName.isEmpty else { return }
+						if let match = ParsecDisplayConfig.restoreMatch(in: config, savedId: savedId, savedName: savedName) {
+							Diagnostics.note("display-output event=restore result=matched rolled=\(match.id != savedId)")
 							DataManager.model.output = match.id
 							SettingsHandler.savedDisplayOutput = match.id // re-sync if id rolled
 							self.updateHostVideoConfig()
+						} else {
+							Diagnostics.note("display-output event=restore result=no-match")
 						}
 					}
 				}
@@ -401,8 +560,6 @@ class ParsecSDKBridge: ParsecService
 		default:
 			break
 		}
-		
-		ParsecFree(pointer)
 		
 	}
 	
@@ -420,8 +577,13 @@ class ParsecSDKBridge: ParsecService
 		getFirstCursor = true
 
 		let pointer = ParsecGetBuffer(_parsec, event.key)
-		if pointer == nil {
+		guard let pointer else {
 			return
+		}
+		CParsec.recordBufferAcquired()
+		defer {
+			ParsecFree(pointer)
+			CParsec.recordBufferFreed()
 		}
 
 		let size = event.cursor.size
@@ -436,8 +598,6 @@ class ParsecSDKBridge: ParsecService
 		let bitmapInfo: CGBitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue)
 		let providerRef: CGDataProvider? = CGDataProvider(data: NSData(bytes: pointer, length: Int(size)))
 		let cgimage: CGImage? = CGImage(width: Int(width), height: Int(height), bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: Int(width) * elmentLength, space: rgbColorSpace, bitmapInfo: bitmapInfo, provider: providerRef!, decode: nil, shouldInterpolate: true, intent: render)
-		ParsecFree(pointer)
-
 		withMouseInfo { info in
 			info.cursorWidth = Int(width)
 			info.cursorHeight = Int(height)
@@ -453,6 +613,27 @@ class ParsecSDKBridge: ParsecService
 		}
 	}
 	
+	// Single owner of the audio session. .playback makes the stream ignore the
+	// mute switch and, with UIBackgroundModes=audio and the always-running
+	// queue, keeps the session alive while backgrounded.
+	private func activateAudio() {
+		let audio = _audioPtr
+		audioSessionQueue.async {
+			let session = AVAudioSession.sharedInstance()
+			do {
+				try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+				try session.setActive(true)
+			} catch {
+				Diagnostics.note("audio-session error=\((error as NSError).code)")
+			}
+			audio_start(audio)
+		}
+	}
+
+	var isAudioKeepAliveActive: Bool {
+		audioWanted && audio_is_running(_audioPtr)
+	}
+
 	func setMuted(_ muted: Bool) {
 		audio_mute(muted, _audioPtr)
 	}
@@ -465,16 +646,20 @@ class ParsecSDKBridge: ParsecService
 		// 0/0 (= "use host default"), which silently overwrote whatever
 		// connect() had set, making it look like the in-overlay Resolution
 		// picker did nothing.
+		let compatibility = ParsecVideoSuspendPolicy.decoderCompatibility(
+			user: SettingsHandler.decoderCompatibility,
+			suspended: videoSuspended
+		)
 		parsecClientCfg.video.0.decoderIndex = 1
 		parsecClientCfg.video.0.resolutionX = Int32(SettingsHandler.resolution.width)
 		parsecClientCfg.video.0.resolutionY = Int32(SettingsHandler.resolution.height)
-		parsecClientCfg.video.0.decoderCompatibility = SettingsHandler.decoderCompatibility
+		parsecClientCfg.video.0.decoderCompatibility = compatibility
 		parsecClientCfg.video.0.decoderH265 = SettingsHandler.decoder == .h265
 
 		parsecClientCfg.video.1.decoderIndex = 1
 		parsecClientCfg.video.1.resolutionX = Int32(SettingsHandler.resolution.width)
 		parsecClientCfg.video.1.resolutionY = Int32(SettingsHandler.resolution.height)
-		parsecClientCfg.video.1.decoderCompatibility = SettingsHandler.decoderCompatibility
+		parsecClientCfg.video.1.decoderCompatibility = compatibility
 		parsecClientCfg.video.1.decoderH265 = SettingsHandler.decoder == .h265
 
 		parsecClientCfg.mediaContainer = mediaContainer
@@ -484,6 +669,70 @@ class ParsecSDKBridge: ParsecService
 
 		ParsecClientSetConfig(_parsec, &parsecClientCfg);
 	}
+
+	func setVideoSuspended(_ suspended: Bool) {
+		let event = suspended ? "suspend" : "resume"
+		guard backgroundTaskRunning, suspended != videoSuspended else {
+			Diagnostics.note("video-pause event=\(event) result=skipped connected=\(backgroundTaskRunning) suspended=\(videoSuspended)")
+			return
+		}
+		videoSuspended = suspended
+		if suspended {
+			// Pause first: the decoder reset's keyframe request (msg 0xd) is
+			// sent by decode_thread up to 100 ms later, behind this message.
+			let result = RemoteStatus(ParsecClientPause(_parsec, true, false))
+			applyConfig() // park: in-flight frames are dropped, not decoded
+			videoResume = nil
+			Diagnostics.note("video-pause event=\(event) result=\(result.rawValue)")
+			Diagnostics.note("decoder-recovery event=parked")
+			return
+		}
+		// Park before resuming: decode_thread checks the config after each
+		// receive, so the stale VT session is gone before any resumed frame.
+		applyConfig()
+		var status = ParsecClientStatus()
+		ParsecClientGetStatus(_parsec, &status)
+		videoResume = (CFAbsoluteTimeGetCurrent(), status.`self`.metrics.0.decodeLatency, false)
+		let result = RemoteStatus(ParsecClientPause(_parsec, false, false))
+		Diagnostics.note("video-pause event=\(event) result=\(result.rawValue)")
+		Diagnostics.note("decoder-recovery event=awaiting-keyframe")
+	}
+
+	/// Resume follow-up, driven by the session poll. Returns the status the
+	/// transport monitor should see: a stalled resume is reported as -14 so the
+	/// existing decode-error reconnect stays the last resort.
+	private func checkVideoResume(_ status: RemoteStatus, decodeLatency: Float) -> RemoteStatus {
+		guard let resume = videoResume else { return status }
+		let elapsed = CFAbsoluteTimeGetCurrent() - resume.at
+		let ms = Int(elapsed * 1000)
+		switch ParsecVideoSuspendPolicy.recovery(
+			elapsed: elapsed,
+			decoded: decodeLatency != resume.decodeLatency,
+			status: status,
+			nudged: resume.nudged
+		) {
+		case .waiting:
+			return status
+		case .recovered:
+			videoResume = nil
+			Diagnostics.note("decoder-recovery event=first-frame ms=\(ms) decodeMs=\(String(format: "%.1f", decodeLatency))")
+			return status
+		case .failed:
+			videoResume = nil
+			Diagnostics.note("decoder-recovery event=failed ms=\(ms) status=\(status.rawValue)")
+			return status
+		case .nudge:
+			videoResume?.nudged = true
+			Diagnostics.note("decoder-recovery event=nudge ms=\(ms) action=video-config-push")
+			// Host restarts capture/encoder on this push → fresh keyframe.
+			DispatchQueue.main.async { self.updateHostVideoConfig() }
+			return status
+		case .stalled:
+			videoResume = nil
+			Diagnostics.note("decoder-recovery event=stalled ms=\(ms) action=reconnect")
+			return RemoteStatus(rawValue: -14)
+		}
+	}
 	
 	// All outgoing-input methods gate on backgroundTaskRunning. False means
 	// we're between an explicit disconnect and the next connect (including
@@ -491,7 +740,7 @@ class ParsecSDKBridge: ParsecService
 	// disconnected SDK is at best a wasted message and at worst a NULL deref
 	// inside ParsecClientSendMessage.
 
-	func sendMouseMessage(_ button:ParsecMouseButton, _ x:Int32, _ y:Int32, _ pressed: Bool)
+	func sendMouseMessage(_ button:RemoteMouseButton, _ x:Int32, _ y:Int32, _ pressed: Bool)
 	{
 		guard backgroundTaskRunning else { return }
 		// Send the mouse position
@@ -500,18 +749,18 @@ class ParsecSDKBridge: ParsecService
 		// Send the mouse button state
 		var buttonMessage = ParsecMessage()
 		buttonMessage.type = MESSAGE_MOUSE_BUTTON
-		buttonMessage.mouseButton.button = button
+		buttonMessage.mouseButton.button = ParsecMouseButton(rawValue: button.rawValue)
 		buttonMessage.mouseButton.pressed = pressed
-		ParsecClientSendMessage(_parsec, &buttonMessage)
+		sendGated(&buttonMessage)
 	}
 
-	func sendMouseClickMessage(_ button:ParsecMouseButton, _ pressed: Bool) {
+	func sendMouseClickMessage(_ button:RemoteMouseButton, _ pressed: Bool) {
 		guard backgroundTaskRunning else { return }
 		var buttonMessage = ParsecMessage()
 		buttonMessage.type = MESSAGE_MOUSE_BUTTON
-		buttonMessage.mouseButton.button = button
+		buttonMessage.mouseButton.button = ParsecMouseButton(rawValue: button.rawValue)
 		buttonMessage.mouseButton.pressed = pressed
-		ParsecClientSendMessage(_parsec, &buttonMessage)
+		sendGated(&buttonMessage)
 	}
 
 	func sendMouseDelta(_ dx: Int32, _ dy: Int32) {
@@ -522,46 +771,40 @@ class ParsecSDKBridge: ParsecService
 		if info.mousePositionRelative {
 			sendMouseRelativeMove(dx, dy)
 		} else {
-			sendMousePosition(info.mouseX + dx, info.mouseY + dy)
+			sendMousePosition(info.mouseX &+ dx, info.mouseY &+ dy)  // clamped inside
 		}
 
 	}
-	static func clamp<T>(_ value: T, minValue: T, maxValue: T) -> T where T : Comparable {
-		return min(max(value, minValue), maxValue)
-	}
 
-	// Swap GUI ↔ Ctrl scan codes when the user has flagged the host as
-	// Windows. Mac-keyboard layout calls the modifier-row keys, left-to-right,
-	// Control / Option / Cmd. On a Windows host the equivalents are
-	// Ctrl / Alt / Win — but Win+C does nothing useful and Ctrl+C is copy.
-	// Remapping at the scan-code layer means every consumer (UIKey path,
-	// virtual keyboard, UIKeyCommand captured shortcuts) gets the swap with
-	// no per-caller awareness.
-	static func remapKeyForHostIfNeeded(_ code: ParsecKeycode) -> ParsecKeycode {
-		guard SettingsHandler.windowsHostKeyboardRemap else { return code }
-		switch code.rawValue {
-		case 227: return ParsecKeycode(224)  // LGUI → LCTRL (Cmd → Ctrl)
-		case 224: return ParsecKeycode(227)  // LCTRL → LGUI (Ctrl → Win)
-		case 231: return ParsecKeycode(228)  // RGUI → RCTRL
-		case 228: return ParsecKeycode(231)  // RCTRL → RGUI
-		default: return code               // Shift / Alt / printable keys unchanged
-		}
+	// Apply only the explicit Windows editing mode. Direct HID remains raw;
+	// Command-as-Control is one-way so physical Control never becomes Win.
+	// Explicit Windows macros pass `.raw` and bypass configured remapping.
+	static func remapKeyForHostIfNeeded(
+		_ code: ParsecKeycode,
+		intent: ParsecKeyboardMappingIntent = .configured
+	) -> ParsecKeycode {
+		let mapped = ParsecWindowsKeyboardMapping.map(
+			RemoteKeyCode(rawValue: code.rawValue),
+			mode: SettingsHandler.effectiveWindowsKeyboardMode,
+			intent: intent
+		)
+		return ParsecKeycode(mapped.rawValue)
 	}
 	
 	func sendMousePosition(_ x:Int32, _ y:Int32)
 	{
 		guard backgroundTaskRunning else { return }
-		let cx = ParsecSDKBridge.clamp(x, minValue: 0, maxValue: Int32(self.clientWidth))
-		let cy = ParsecSDKBridge.clamp(y, minValue: 0, maxValue: Int32(self.clientHeight))
+		let cx = min(max(x, 0), Int32(self.clientWidth))
+		let cy = min(max(y, 0), Int32(self.clientHeight))
 		withMouseInfo {
 			$0.mouseX = cx
 			$0.mouseY = cy
 		}
 		var motionMessage = ParsecMessage()
 		motionMessage.type = MESSAGE_MOUSE_MOTION
-		motionMessage.mouseMotion.x = x
-		motionMessage.mouseMotion.y = y
-		ParsecClientSendMessage(_parsec, &motionMessage)
+		motionMessage.mouseMotion.x = cx
+		motionMessage.mouseMotion.y = cy
+		sendGated(&motionMessage)
 	}
 
 	func sendMouseRelativeMove(_ dx:Int32, _ dy:Int32)
@@ -572,7 +815,7 @@ class ParsecSDKBridge: ParsecService
 		motionMessage.mouseMotion.x = dx
 		motionMessage.mouseMotion.y = dy
 		motionMessage.mouseMotion.relative = true
-		ParsecClientSendMessage(_parsec, &motionMessage)
+		sendGated(&motionMessage)
 	}
 	
 	func getKeyCodeByText(text: String) -> (ParsecKeycode?, Bool) {
@@ -581,7 +824,7 @@ class ParsecSDKBridge: ParsecService
 		if text.count == 1 {
 			let char = Character(text)
 			if char.isLetter || char.isNumber {
-				keyCode = KeyCodeTranslators.parsecKeyCodeTranslator(text.uppercased())
+				keyCode = KeyCodeTranslators.parsecKeyCodeTranslator(text.uppercased()).map { ParsecKeycode($0.rawValue) }
 				if char.isUppercase {
 					useShift = true
 				}
@@ -590,7 +833,7 @@ class ParsecSDKBridge: ParsecService
 			} else if char.isWhitespace{
 				keyCode = ParsecKeycode(44)
 			} else {
-				let (keycodeRaw, keyMod) = KeyCodeTranslators.getParsecKeycode(for: text)
+				let (keycodeRaw, keyMod) = KeyCodeTranslators.getRemoteKeyCode(for: text)
 				if keycodeRaw != -1 {
 					keyCode = ParsecKeycode(UInt32(keycodeRaw))
 					if keyMod {
@@ -599,7 +842,7 @@ class ParsecSDKBridge: ParsecService
 				}
 			}
 		} else {
-			keyCode = KeyCodeTranslators.parsecKeyCodeTranslator(text)
+			keyCode = KeyCodeTranslators.parsecKeyCodeTranslator(text).map { ParsecKeycode($0.rawValue) }
 		}
 		
 		return (keyCode, useShift)
@@ -613,75 +856,74 @@ class ParsecSDKBridge: ParsecService
 			return
 		}
 		let remapped = ParsecSDKBridge.remapKeyForHostIfNeeded(keyCode)
-		var keyboardMessagePress = ParsecMessage()
-		keyboardMessagePress.type = MESSAGE_KEYBOARD
-		if !isVirtualShiftOn && useShift {
-			keyboardMessagePress.keyboard = ParsecKeyboardMessage(code: KEY_LSHIFT, mod: MOD_NONE, pressed: true, __pad: (0,0,0))
-			ParsecClientSendMessage(_parsec, &keyboardMessagePress)
+		// Shift injection is decided once at press time so the delayed
+		// release always mirrors exactly what was pressed.
+		let taps = ParsecVirtualKeyTap.sequence(
+			code: remapped.rawValue,
+			needsShift: useShift,
+			shiftHeld: isVirtualShiftOn
+		)
+		let send = { (tap: (code: UInt32, pressed: Bool)) in
+			var message = ParsecMessage()
+			message.type = MESSAGE_KEYBOARD
+			message.keyboard = ParsecKeyboardMessage(code: ParsecKeycode(tap.code), mod: MOD_NONE, pressed: tap.pressed, __pad: (0,0,0))
+			self.sendGated(&message)
 		}
-		keyboardMessagePress.keyboard = ParsecKeyboardMessage(code: remapped, mod: MOD_NONE, pressed: true, __pad: (0,0,0))
-		ParsecClientSendMessage(_parsec, &keyboardMessagePress)
-
-		// add release delay in case some games ignore instant key release
-		DispatchQueue.global().asyncAfter(deadline: .now() + 0.02) {
-			// Re-check the gate inside the closure: a disconnect can land in
-			// these 20 ms (matches the drain sleep in disconnect() exactly),
-			// in which case we would otherwise fire ParsecClientSendMessage
-			// against a torn-down client.
-			guard self.backgroundTaskRunning else { return }
-			keyboardMessagePress.keyboard = ParsecKeyboardMessage(code: remapped, mod: MOD_NONE, pressed: false, __pad: (0,0,0))
-			if !self.isVirtualShiftOn && useShift {
-				keyboardMessagePress.keyboard = ParsecKeyboardMessage(code: KEY_LSHIFT, mod: MOD_NONE, pressed: false, __pad: (0,0,0))
-			}
-			ParsecClientSendMessage(self._parsec, &keyboardMessagePress)
+		// One serial queue for every soft-keyboard tap: press, hold 20 ms (some
+		// games ignore instant releases), release. Taps never overlap, so an
+		// injected Shift can't leak into the next character of a paste
+		// ("Hello" arriving as "HELLO") and order is preserved.
+		// Bound to this session: a long paste still queued after a reconnect
+		// must not keep typing into the new session.
+		pollCondition.lock()
+		let generation = pollGeneration
+		pollCondition.unlock()
+		virtualKeyQueue.async {
+			guard self.shouldPoll(generation: generation) else { return }
+			taps.filter { $0.pressed }.forEach(send)
+			usleep(20_000)
+			guard self.shouldPoll(generation: generation) else { return }
+			taps.filter { !$0.pressed }.forEach(send)
 		}
-	}
-	
-	func sendVirtualKeyboardInput(text: String, isOn: Bool) {
-		guard backgroundTaskRunning else { return }
-		let (keyCode, _) = getKeyCodeByText(text: text)
-
-		guard let keyCode else {
-			return
-		}
-
-		if keyCode.rawValue == 225 {
-			isVirtualShiftOn = isOn
-		}
-
-		let remapped = ParsecSDKBridge.remapKeyForHostIfNeeded(keyCode)
-		var keyboardMessagePress = ParsecMessage()
-		keyboardMessagePress.type = MESSAGE_KEYBOARD
-		keyboardMessagePress.keyboard.pressed = isOn
-		keyboardMessagePress.keyboard.code = remapped
-		ParsecClientSendMessage(_parsec, &keyboardMessagePress)
-
 	}
 
 	func sendKeyboardMessage(event:KeyBoardKeyEvent)
 	{
 		guard backgroundTaskRunning else { return }
-		if event.input == nil {
-			return
+		// Physical or toolbar Shift held: soft-keyboard taps must not inject
+		// (and then release) their own Shift.
+		if event.key.rawValue == 225 || event.key.rawValue == 229 {
+			isVirtualShiftOn = event.isPressBegin
 		}
+		keyboardMappingLock.lock()
+		let mappedCode = keyboardMappingLatch.map(
+			event.key,
+			pressed: event.isPressBegin,
+			mode: SettingsHandler.effectiveWindowsKeyboardMode,
+			intent: event.mappingIntent
+		)
+		keyboardMappingLock.unlock()
 
-		let rawCode = ParsecKeycode(UInt32(KeyCodeTranslators.uiKeyCodeToInt(key: event.input?.keyCode ?? UIKeyboardHIDUsage.keyboardErrorUndefined)))
 		var keyboardMessagePress = ParsecMessage()
 		keyboardMessagePress.type = MESSAGE_KEYBOARD
-		keyboardMessagePress.keyboard.code = ParsecSDKBridge.remapKeyForHostIfNeeded(rawCode)
+		keyboardMessagePress.keyboard.code = ParsecKeycode(mappedCode.rawValue)
 		keyboardMessagePress.keyboard.pressed = event.isPressBegin
-		ParsecClientSendMessage(_parsec, &keyboardMessagePress)
+		let sent = sendGated(&keyboardMessagePress)
+		// A lost key-up is a stuck key on the host; make it visible in logs.
+		if sent != PARSEC_OK && !event.isPressBegin {
+			Diagnostics.note("input-release-failed status=\(sent.rawValue)")
+		}
 	}
 	
-	func sendGameControllerButtonMessage(controllerId: UInt32, _ button:ParsecGamepadButton, pressed: Bool)
+	func sendGameControllerButtonMessage(controllerId: UInt32, _ button:RemoteGamepadButton, pressed: Bool)
 	{
 		guard backgroundTaskRunning else { return }
 		var pmsg = ParsecMessage()
 		pmsg.type = MESSAGE_GAMEPAD_BUTTON
 		pmsg.gamepadButton.id = controllerId
-		pmsg.gamepadButton.button = button
+		pmsg.gamepadButton.button = ParsecGamepadButton(rawValue: button.rawValue)
 		pmsg.gamepadButton.pressed = pressed
-		ParsecClientSendMessage(_parsec, &pmsg)
+		sendGated(&pmsg)
 	}
 	
 	/*static func sendGameControllerTriggerButtonMessage(controllerId: UInt32, _ button:ParsecGamepadAxis, pressed: Bool)
@@ -691,18 +933,18 @@ class ParsecSDKBridge: ParsecService
 		pmsg.gamepadAxis.id = controllerId
 		pmsg.gamepadAxis.button = button
 		pmsg.gamepadAxis.pressed = pressed
-		ParsecClientSendMessage(_parsec, &pmsg)
+		sendGated(&pmsg)
 	}*/
 	
-	func sendGameControllerAxisMessage(controllerId: UInt32, _ button:ParsecGamepadAxis, _ value: Int16)
+	func sendGameControllerAxisMessage(controllerId: UInt32, _ axis:RemoteGamepadAxis, _ value: Int16)
 	{
 		guard backgroundTaskRunning else { return }
 	    var pmsg = ParsecMessage()
 		pmsg.type = MESSAGE_GAMEPAD_AXIS
 		pmsg.gamepadAxis.id = controllerId
-		pmsg.gamepadAxis.axis = button
+		pmsg.gamepadAxis.axis = ParsecGamepadAxis(rawValue: axis.rawValue)
 		pmsg.gamepadAxis.value = value
-		ParsecClientSendMessage(_parsec, &pmsg)
+		sendGated(&pmsg)
 	}
 	
 	func sendGameControllerUnplugMessage(controllerId: UInt32)
@@ -711,7 +953,7 @@ class ParsecSDKBridge: ParsecService
 	    var pmsg = ParsecMessage()
 		pmsg.type = MESSAGE_GAMEPAD_UNPLUG;
 		pmsg.gamepadUnplug.id = controllerId;
-		ParsecClientSendMessage(_parsec, &pmsg)
+		sendGated(&pmsg)
 	}
 	
 	func sendWheelMsg(x: Int32, y: Int32) {
@@ -720,7 +962,7 @@ class ParsecSDKBridge: ParsecService
 		pmsg.type = MESSAGE_MOUSE_WHEEL;
 		pmsg.mouseWheel.x = x
 		pmsg.mouseWheel.y = y
-		ParsecClientSendMessage(_parsec, &pmsg)
+		sendGated(&pmsg)
 	}
 	
 	func startBackgroundTask(){
@@ -732,29 +974,60 @@ class ParsecSDKBridge: ParsecService
 			: SettingsHandler.preferredFramesPerSecond
 		let pollTimeout = UInt32(max(1000 / fps, 8))
 
-		// Advance the generation and capture it for this pair of loops. Any
-		// previously-spawned loop sees the bumped value and exits.
+		pollCondition.lock()
+		guard activePollerCount == 0 else {
+			let active = activePollerCount
+			pollCondition.unlock()
+			Diagnostics.note("sdk-poll event=start-rejected active=\(active)")
+			return
+		}
 		pollGeneration &+= 1
 		let generation = pollGeneration
+		isPolling = true
+		activePollerCount = 2
+		pollCondition.unlock()
+		Diagnostics.note("sdk-poll event=started generation=\(generation) active=2")
 
-		let item1 = DispatchWorkItem {
-			while self.backgroundTaskRunning && self.pollGeneration == generation {
+		let audioItem = DispatchWorkItem {
+			defer { self.pollerDidFinish() }
+			while self.shouldPoll(generation: generation) {
 				self.pollAudio(timeout: pollTimeout)
 			}
 		}
-
-		let item2 = DispatchWorkItem {
-			while self.backgroundTaskRunning && self.pollGeneration == generation {
+		let eventItem = DispatchWorkItem {
+			defer { self.pollerDidFinish() }
+			while self.shouldPoll(generation: generation) {
 				self.pollEvent(timeout: pollTimeout)
 			}
 		}
-		// .userInteractive is the right QoS for remote-desktop input/event
-		// dispatch — these threads gate audio callbacks and cursor updates.
-		// Previously used unspecified (.default) which sometimes coalesces
-		// under system load.
 		let pollQueue = DispatchQueue.global(qos: .userInteractive)
-		pollQueue.async(execute: item1)
-		pollQueue.async(execute: item2)
+		pollQueue.async(execute: audioItem)
+		pollQueue.async(execute: eventItem)
+	}
+
+	private func shouldPoll(generation: UInt64) -> Bool {
+		pollCondition.lock()
+		defer { pollCondition.unlock() }
+		return isPolling && pollGeneration == generation
+	}
+
+	private func pollerDidFinish() {
+		pollCondition.lock()
+		activePollerCount -= 1
+		pollCondition.broadcast()
+		pollCondition.unlock()
+	}
+
+	private func stopBackgroundTaskAndWait() {
+		pollCondition.lock()
+		isPolling = false
+		pollGeneration &+= 1
+		while activePollerCount > 0 {
+			pollCondition.wait()
+		}
+		let generation = pollGeneration
+		pollCondition.unlock()
+		Diagnostics.note("sdk-poll event=drained generation=\(generation) active=0")
 	}
 	
 	func sendUserData(type: ParsecUserDataType, message: Data) {
@@ -766,6 +1039,9 @@ class ParsecSDKBridge: ParsecService
         nullTerminatedMessage.append(0)
 		nullTerminatedMessage.withUnsafeBytes { ptr in
 			let ptr2 = ptr.baseAddress?.assumingMemoryBound(to: CChar.self)
+			sendGate.lock()
+			defer { sendGate.unlock() }
+			guard backgroundTaskRunning else { return }
 			ParsecClientSendUserData(_parsec, type.rawValue, ptr2)
 		}
 	}
@@ -786,6 +1062,22 @@ class ParsecSDKBridge: ParsecService
 		configRevision &+= 1
 		let revision = configRevision
 		pendingUserConfig = (DataManager.model.bitrate, DataManager.model.constantFps)
+		// Track a concrete display switch so the confirm-and-retry loop below can
+		// keep re-asserting it. "none" (Auto) has no stable echoed id to confirm
+		// against, so it just rides the base send + the existing 250 ms resend.
+		let switchTarget = DataManager.model.output
+		Diagnostics.note(
+			"video-config event=push revision=\(revision) output=\(switchTarget) " +
+			"bitrate=\(videoConfig.video[0].encoderMaxBitrate) fullFPS=\(videoConfig.video[0].fullFPS) " +
+			"res=\(videoConfig.video[0].resolutionX)x\(videoConfig.video[0].resolutionY)"
+		)
+		if switchTarget != "none" && !switchTarget.isEmpty && switchTarget != hostOutput {
+			pendingOutputSince = Date()
+			pendingOutput = switchTarget
+			scheduleDisplaySwitchRetry(revision: revision, data: data, attempt: 0)
+		} else {
+			pendingOutput = nil
+		}
 
 		CParsec.sendUserData(type: .setVideoConfig, message: data)
 		// User reports: display switches needed two or three taps to actually
@@ -813,4 +1105,43 @@ class ParsecSDKBridge: ParsecService
 			self.pendingUserConfig = nil
 		}
 	}
+
+	// Re-assert a display switch on a widening schedule until the host's case-11
+	// echo confirms it (which clears pendingOutput) or we exhaust the attempts.
+	// A display change re-inits the host encoder for the new output; a request
+	// that lands during that reset is dropped, so one fire-and-forget send (or a
+	// single 250 ms resend, which fires while the host is often still busy) was
+	// unreliable — hence the historical "needs two or three taps". Each resend is
+	// idempotent (same output reapplied is a no-op once it's the active display),
+	// so over-asserting is harmless; under-asserting was the bug.
+	private func scheduleDisplaySwitchRetry(revision: Int, data: Data, attempt: Int) {
+		let delays: [Double] = [0.35, 0.8, 1.5, 2.5]
+		guard attempt < delays.count else {
+			// Give up re-asserting; drop the guard so a host that never echoes a
+			// matching output can't leave it pending forever.
+			DispatchQueue.main.async { [weak self] in
+				guard let self = self, self.configRevision == revision, let out = self.pendingOutput else { return }
+				self.pendingOutput = nil
+				Diagnostics.note("display-output event=timeout output=\(out) ms=\(Int(Date().timeIntervalSince(self.pendingOutputSince) * 1000))")
+			}
+			return
+		}
+		DispatchQueue.global().asyncAfter(deadline: .now() + delays[attempt]) { [weak self] in
+			guard let self = self, self.backgroundTaskRunning, self.configRevision == revision else { return }
+			// pendingOutput is mutated on the main queue (set in updateHostVideoConfig,
+			// cleared by the case-11 confirmation echo). It's a String?, not an atomic
+			// scalar, so read it on main to avoid racing that clear. Re-assert there if
+			// the switch is still unconfirmed — sending on main is fine (the base send
+			// at the top of updateHostVideoConfig already does).
+			DispatchQueue.main.async {
+				guard self.backgroundTaskRunning, self.configRevision == revision, let out = self.pendingOutput else { return }
+				Diagnostics.note("display-output event=retry attempt=\(attempt + 1) output=\(out)")
+				CParsec.sendUserData(type: .setVideoConfig, message: data)
+				let empty = "".data(using: .utf8)!
+				CParsec.sendUserData(type: .getVideoConfig, message: empty)
+				self.scheduleDisplaySwitchRetry(revision: revision, data: data, attempt: attempt + 1)
+			}
+		}
+	}
 }
+#endif

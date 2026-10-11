@@ -1,4 +1,5 @@
 import UIKit
+import Network
 import Darwin
 
 // Lightweight crash reporter. Writes the last uncaught exception / fatal
@@ -19,14 +20,24 @@ enum CrashReporter {
 	// SIGSEGV/SIGABRT), any allocation inside the handler deadlocks and the log
 	// never gets written — exactly the failure that made crashes undiagnosable.
 	// So everything the handler touches is allocated up front here.
-	private static var logPathC: UnsafeMutablePointer<CChar>? = nil          // strdup'd log path
-	private static var headerPrefixC: UnsafeMutablePointer<CChar>? = nil     // "=== OpenParsec fatal signal "
-	private static var headerSuffixC: UnsafeMutablePointer<CChar>? = nil     // " ===\nBacktrace:\n"
+	//
+	// All of it is `static let` (immutable): reading a `static var` from the
+	// handler runs Swift's exclusivity check (swift_beginAccess), which can
+	// allocate — on a corrupt heap that re-crashed the handler (SIGTRAP) and
+	// overwrote the real signal in last_crash.log. install() touches each one
+	// so their one-time initialisation never happens inside the handler.
+	private static let logPathC: UnsafeMutablePointer<CChar> = strdup(logURL.path)
+	private static let headerPrefixC: UnsafeMutablePointer<CChar> = strdup("=== OpenParsec fatal signal ")
+	private static let headerSuffixC: UnsafeMutablePointer<CChar> = strdup(" ===\nBacktrace:\n")
 	private static let backtraceCapacity: Int32 = 128
-	private static var backtraceBuffer: UnsafeMutablePointer<UnsafeMutableRawPointer?>? = nil
+	private static let backtraceBuffer = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 128)
 	// Set to 1 by the NSException handler so a following SIGABRT (from the
 	// uncaught-exception abort) appends instead of clobbering the richer log.
-	private static var exceptionRecorded: sig_atomic_t = 0
+	private static let exceptionRecorded: UnsafeMutablePointer<sig_atomic_t> = {
+		let flag = UnsafeMutablePointer<sig_atomic_t>.allocate(capacity: 1)
+		flag.pointee = 0
+		return flag
+	}()
 
 	// Rich recorder for the NSException path ONLY. Runs in normal context
 	// (not a signal trampoline), so Foundation/allocation is safe here.
@@ -37,7 +48,7 @@ enum CrashReporter {
 		text += Thread.callStackSymbols.joined(separator: "\n")
 		text += "\n"
 		try? text.write(to: logURL, atomically: true, encoding: .utf8)
-		exceptionRecorded = 1
+		exceptionRecorded.pointee = 1
 	}
 
 	// Async-signal-safe write of a decimal Int32 using a stack buffer only —
@@ -59,35 +70,37 @@ enum CrashReporter {
 	// backtrace, backtrace_symbols_fd (writes straight to the fd, no malloc),
 	// close, signal, raise.
 	private static func handleSignal(_ s: Int32) {
-		if let path = logPathC {
-			// Append (don't truncate) if the exception handler already wrote a
-			// richer log before abort()ing into this signal.
-			let flags = exceptionRecorded != 0
-				? (O_WRONLY | O_CREAT | O_APPEND)
-				: (O_WRONLY | O_CREAT | O_TRUNC)
-			let fd = open(path, flags, 0o644)
-			if fd >= 0 {
-				if let h = headerPrefixC { _ = write(fd, h, strlen(h)) }
-				writeInt(fd, s)
-				if let h = headerSuffixC { _ = write(fd, h, strlen(h)) }
-				if let buf = backtraceBuffer {
-					let frames = backtrace(buf, backtraceCapacity)
-					backtrace_symbols_fd(buf, frames, fd)
-				}
-				_ = fsync(fd)
-				close(fd)
-			}
+		// First: a fault inside this handler must kill the app, not re-enter
+		// it and truncate the log. Separate calls (an array would allocate).
+		signal(SIGABRT, SIG_DFL)
+		signal(SIGSEGV, SIG_DFL)
+		signal(SIGBUS, SIG_DFL)
+		signal(SIGILL, SIG_DFL)
+		signal(SIGFPE, SIG_DFL)
+		signal(SIGTRAP, SIG_DFL)
+		// Append (don't truncate) if the exception handler already wrote a
+		// richer log before abort()ing into this signal.
+		let flags = exceptionRecorded.pointee != 0
+			? (O_WRONLY | O_CREAT | O_APPEND)
+			: (O_WRONLY | O_CREAT | O_TRUNC)
+		let fd = open(logPathC, flags, 0o644)
+		if fd >= 0 {
+			_ = write(fd, headerPrefixC, strlen(headerPrefixC))
+			writeInt(fd, s)
+			_ = write(fd, headerSuffixC, strlen(headerSuffixC))
+			let frames = backtrace(backtraceBuffer, backtraceCapacity)
+			backtrace_symbols_fd(backtraceBuffer, frames, fd)
+			_ = fsync(fd)
+			close(fd)
 		}
-		signal(s, SIG_DFL)
 		raise(s)
 	}
 
 	static func install() {
-		// Pre-allocate everything the signal handler will touch.
-		logPathC = strdup(logURL.path)
-		headerPrefixC = strdup("=== OpenParsec fatal signal ")
-		headerSuffixC = strdup(" ===\nBacktrace:\n")
-		backtraceBuffer = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: Int(backtraceCapacity))
+		// Initialise everything the signal handler touches now, and load
+		// backtrace()'s machinery once so the handler never triggers dyld work.
+		_ = (logPathC, headerPrefixC, headerSuffixC, exceptionRecorded)
+		_ = backtrace(backtraceBuffer, 1)
 
 		NSSetUncaughtExceptionHandler { exception in
 			CrashReporter.record(
@@ -106,6 +119,10 @@ enum CrashReporter {
 	// Non-destructive read so a Settings "Copy Last Crash Log" action can
 	// retrieve it at any time. The file is overwritten on the next crash and
 	// can be cleared explicitly via clear().
+	static var hasLog: Bool {
+		FileManager.default.fileExists(atPath: logURL.path)
+	}
+
 	static func peek() -> String? {
 		guard let text = try? String(contentsOf: logURL, encoding: .utf8), !text.isEmpty else { return nil }
 		return text
@@ -128,28 +145,91 @@ enum Diagnostics {
 		return docs.appendingPathComponent("diagnostics.log")
 	}
 
+	// Called from SDK log/poll threads too; serialize seek+write so lines never interleave.
+	private static let lock = NSLock()
+	// Created once (~60 µs each); only used under `lock`.
+	private static let formatter = ISO8601DateFormatter()
+
 	static func note(_ line: String) {
-		let stamp = ISO8601DateFormatter().string(from: Date())
+		lock.lock()
+		defer { lock.unlock() }
+		let stamp = formatter.string(from: Date())
 		let entry = "[\(stamp)] \(line)\n"
 		print("[OpenParsec][diag] \(line)")
 		guard let data = entry.data(using: .utf8) else { return }
 		if let handle = try? FileHandle(forWritingTo: logURL) {
-			defer { try? handle.close() }
-			handle.seekToEndOfFile()
-			handle.write(data)
+			// Throwing APIs: the legacy seekToEndOfFile()/write(_:) raise an
+			// ObjC exception (uncatchable crash) on errors such as a full disk.
+			let size = (try? handle.seekToEnd()) ?? 0
+			try? handle.write(contentsOf: data)
+			try? handle.close()
+			// Long background-audio sessions log for hours: cap while running.
+			if size > 4_000_000 { trimIfNeeded(maxBytes: 4_000_000) }
 		} else {
 			// File doesn't exist yet — create it with this first entry.
 			try? data.write(to: logURL, options: .atomic)
 		}
 	}
 
-	static func peek() -> String? {
-		guard let text = try? String(contentsOf: logURL, encoding: .utf8), !text.isEmpty else { return nil }
-		return text
+	// SDK log lines make the file grow; keep the newest ~1 MB across launches.
+	static func trimIfNeeded(maxBytes: Int = 2_000_000) {
+		guard let data = try? Data(contentsOf: logURL), data.count > maxBytes else { return }
+		try? data.suffix(maxBytes / 2).write(to: logURL, options: .atomic)
 	}
+
+	static var hasLog: Bool {
+		FileManager.default.fileExists(atPath: logURL.path)
+	}
+
+	static func peek() -> String? {
+		// Lossy decode: a trim can cut a multi-byte character in half.
+		guard let data = try? Data(contentsOf: logURL), !data.isEmpty else { return nil }
+		return String(decoding: data, as: UTF8.self)
+	}
+
 
 	static func clear() {
 		try? FileManager.default.removeItem(at: logURL)
+	}
+}
+
+// Records network path changes and exposes a digest for connect diagnostics,
+// so NAT/UDP failures (-6013, -6023) can be correlated with Wi-Fi state.
+enum NetworkPathObserver {
+	private static let lock = NSLock()
+	private static var current = "net=unknown"
+	private static let monitor: NWPathMonitor = {
+		let monitor = NWPathMonitor()
+		monitor.pathUpdateHandler = { path in
+			let kind = path.usesInterfaceType(.wifi) ? "wifi"
+				: path.usesInterfaceType(.wiredEthernet) ? "ethernet"
+				: path.usesInterfaceType(.cellular) ? "cellular" : "other"
+			// iOS always has idle utun interfaces, so only a tunnel as the
+			// preferred interface means traffic goes through a VPN (which
+			// often drops UDP: -6013).
+			let primary = path.availableInterfaces.first?.name ?? "none"
+			let vpn = isVPN(primary)
+			let digest = "net=\(path.status) if=\(kind) primary=\(primary) vpn=\(vpn) expensive=\(path.isExpensive) constrained=\(path.isConstrained)"
+			lock.lock()
+			let changed = current != digest
+			current = digest
+			lock.unlock()
+			if changed { Diagnostics.note("network-path \(digest)") }
+		}
+		monitor.start(queue: DispatchQueue(label: "openparsec.network-path"))
+		return monitor
+	}()
+
+	static func start() { _ = monitor }
+
+	static func isVPN(_ interfaceName: String) -> Bool {
+		["utun", "ipsec", "ppp", "tap", "tun"].contains(where: interfaceName.hasPrefix)
+	}
+
+	static var digest: String {
+		lock.lock()
+		defer { lock.unlock() }
+		return current
 	}
 }
 
@@ -161,9 +241,15 @@ class AppDelegate: UIResponder, UIApplicationDelegate
 		// Install the crash reporter as early as possible so it catches
 		// failures during the rest of launch too.
 		CrashReporter.install()
+		Diagnostics.trimIfNeeded()
+		NetworkPathObserver.start()
 		// Q1: repair the hideStatusBar / cursorScale shared-key corruption
 		// before any UI reads these settings.
 		SettingsHandler.migrateLegacyStatusBarKeyIfNeeded()
+		SettingsHandler.migratePointerPresentationModeIfNeeded()
+		SettingsHandler.migrateWindowsKeyboardRemapIfNeeded()
+		SettingsHandler.migrateHostShortcutToolbarIfNeeded()
+		SettingsHandler.migrateLayoutSyncHotkeyIfNeeded()
 		if let crash = CrashReporter.peek() {
 			// Make the previous crash trivially retrievable: copy to the
 			// pasteboard (syncs to a Mac on the same Apple ID via Universal

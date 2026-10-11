@@ -1,0 +1,22 @@
+{
+ "Name": "Parsec direct",
+ "GlobalProxy": "true",
+ "DirectSites": [
+  "domain:parsec.app",
+  "domain:parsecgaming.com",
+  "domain:parsecusercontent.com",
+  "geosite:cn"
+ ],
+ "DirectIp": [
+  "35.169.37.243/32",
+  "2600:1f18:63d9::/48",
+  "geoip:private",
+  "geoip:cn"
+ ],
+ "ProxySites": [],
+ "ProxyIp": [],
+ "BlockSites": [],
+ "BlockIp": [],
+ "DomainStrategy": "IPIfNonMatch",
+ "FakeDNS": "false"
+}

@@ -1,5 +1,4 @@
 import Foundation
-import ParsecSDK
 import UIKit
 import SwiftUI
 import GameController

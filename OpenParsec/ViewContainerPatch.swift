@@ -66,6 +66,24 @@ extension UIViewController {
 		setNeedsUpdateOfPrefersPointerLocked()
 	}
 	
+	// Without forwarding, the session's edge-gesture deferral was silently
+	// ignored (the iPad Dock/home swipe fired on the first touch or pointer
+	// push at the bottom edge).
+	private static let _childForScreenEdgesStorage = NSMapTable<UIViewController, UIViewController>.weakToWeakObjects()
+
+	@objc private dynamic var _childForScreenEdgesDeferringSystemGestures: UIViewController? {
+		Self._childForScreenEdgesStorage.object(forKey: self)
+	}
+
+	@objc dynamic func setChildForScreenEdgesDeferringSystemGestures(_ value: UIViewController?) {
+		if let value = value {
+			Self._childForScreenEdgesStorage.setObject(value, forKey: self)
+		} else {
+			Self._childForScreenEdgesStorage.removeObject(forKey: self)
+		}
+		setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
+	}
+
 	/// SwiftUI currently does not provide a way to set the View Conrtoller's home indicator or pointer lock
 	fileprivate static func patchViewController() {
 		patch(#selector(getter: Self.childForHomeIndicatorAutoHidden),
@@ -73,6 +91,9 @@ extension UIViewController {
 			  class: Self.self)
 		patch(#selector(getter: Self.childViewControllerForPointerLock),
 			  with: #selector(getter: Self._childViewControllerForPointerLock),
+			  class: Self.self)
+		patch(#selector(getter: Self.childForScreenEdgesDeferringSystemGestures),
+			  with: #selector(getter: Self._childForScreenEdgesDeferringSystemGestures),
 			  class: Self.self)
 	}
 }

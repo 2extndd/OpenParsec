@@ -33,7 +33,9 @@ class ParsecGLKViewController : ParsecPlayground {
 	var glkRenderer: ParsecGLKRenderer!
 	let updateImage:() -> Void
 	
-	let viewController: UIViewController
+	// unowned: the ParsecViewController owns this surface; a strong ref leaked
+	// every session controller together with a live render loop.
+	unowned let viewController: UIViewController
 	
 	required init(viewController: UIViewController, updateImage: @escaping () -> Void) {
 		self.viewController = viewController
@@ -57,15 +59,10 @@ class ParsecGLKViewController : ParsecPlayground {
 		// resolution changes; this just keeps the surface pinned otherwise.
 		glkView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
 		glkViewController.view = glkView
+		// ParsecViewController.appDidBecomeActive owns resume (after layout settles).
+		glkViewController.resumeOnDidBecomeActive = false
 
-		// Use configured FPS or device max (for ProMotion displays)
-		let fps = SettingsHandler.preferredFramesPerSecond
-		if fps == 0 {
-			// Use device's maximum refresh rate (120Hz on ProMotion iPads)
-			glkViewController.preferredFramesPerSecond = Int(UIScreen.main.maximumFramesPerSecond)
-		} else {
-			glkViewController.preferredFramesPerSecond = fps
-		}
+		applyPreferredFrameRate()
 
 		self.viewController.addChild(glkViewController)
 		self.viewController.view.addSubview(glkViewController.view)
@@ -83,6 +80,24 @@ class ParsecGLKViewController : ParsecPlayground {
 		glkViewController.isPaused = true
 	}
 
+	// Fully detach one paused GLK surface before a replacement is created.
+	// Keeping two child controllers alive can make the SDK render through a
+	// stale EAGL context after reconnect.
+	func detach() {
+		glkViewController.isPaused = true
+		glkView?.delegate = nil
+		glkViewController.delegate = nil
+		glkViewController.willMove(toParent: nil)
+		glkViewController.view.removeFromSuperview()
+		glkViewController.removeFromParent()
+		if EAGLContext.current() === glkView?.context {
+			_ = EAGLContext.setCurrent(nil)
+		}
+		glkRenderer = nil
+		glkViewController.view = nil
+		glkView = nil
+	}
+
 	// Idempotent render resume. Safe to call repeatedly. Makes the EAGL
 	// context current on the main thread (where GLKViewController renders),
 	// unpauses the loop LAST (Apple's ordering rule), then forces one frame
@@ -91,6 +106,8 @@ class ParsecGLKViewController : ParsecPlayground {
 	// on screen return: any path that left isPaused == true (changeResolution,
 	// PiP, background) is self-healed here.
 	func resume() {
+		// GL work while backgrounded gets the process killed by iOS.
+		guard UIApplication.shared.applicationState != .background else { return }
 		if let ctx = glkView?.context {
 			_ = EAGLContext.setCurrent(ctx)
 		}
@@ -98,9 +115,23 @@ class ParsecGLKViewController : ParsecPlayground {
 		glkView?.setNeedsDisplay()
 	}
 
+	func synchronizeDimensions() {
+		guard UIApplication.shared.applicationState != .background else { return }
+		glkRenderer?.synchronizeDimensions()
+		glkView?.setNeedsDisplay()
+	}
+
+	func applyPreferredFrameRate() {
+		let fps = SettingsHandler.preferredFramesPerSecond
+		glkViewController.preferredFramesPerSecond = fps == 0
+			? Int(UIScreen.main.maximumFramesPerSecond)
+			: fps
+	}
+
 	func updateSize(width: CGFloat, height: CGFloat) {
-		glkView.frame.size.width = width
-		glkView.frame.size.height = height
+		// The GL surface always fills its parent (ParsecViewController.contentView)
+		// exactly, so drawable = view pixels and SDK dimensions = view points.
+		glkView.frame = CGRect(x: 0, y: 0, width: width, height: height)
 	}
 
 	

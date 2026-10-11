@@ -52,6 +52,12 @@ jobs:
           file_to_build=`ls -A | grep -i \\.xcworkspace\$ || ls -A | grep -i \\.xcodeproj\$`
           file_to_build=`echo $file_to_build | awk '{$1=$1;print}'`
           echo "file_to_build=$file_to_build" >> $GITHUB_OUTPUT
+      - name: Unit and UI tests (gate packaging)
+        run: |
+          export DEVELOPER_DIR="$(xcode-select -p)"
+          bash scripts/test.sh
+      - name: Audio ring check
+        run: xcrun clang -framework AudioToolbox scripts/audio-ring-check.c -o /tmp/audio-ring-check && /tmp/audio-ring-check
       - name: Archive
         env:
           scheme: ${{ steps.scheme.outputs.scheme }}

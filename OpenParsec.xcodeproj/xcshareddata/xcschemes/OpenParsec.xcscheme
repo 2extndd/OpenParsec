@@ -20,6 +20,34 @@
                ReferencedContainer = "container:OpenParsec.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "A4C64539169BC5B6B61AD45B"
+               BuildableName = "OpenParsecTests.xctest"
+               BlueprintName = "OpenParsecTests"
+               ReferencedContainer = "container:OpenParsec.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "31BDA7B946DCF2B87F95BE0E"
+               BuildableName = "OpenParsecUITests.xctest"
+               BlueprintName = "OpenParsecUITests"
+               ReferencedContainer = "container:OpenParsec.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
    <TestAction
@@ -28,6 +56,26 @@
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       shouldUseLaunchSchemeArgsEnv = "YES">
       <Testables>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "A4C64539169BC5B6B61AD45B"
+               BuildableName = "OpenParsecTests.xctest"
+               BlueprintName = "OpenParsecTests"
+               ReferencedContainer = "container:OpenParsec.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "31BDA7B946DCF2B87F95BE0E"
+               BuildableName = "OpenParsecUITests.xctest"
+               BlueprintName = "OpenParsecUITests"
+               ReferencedContainer = "container:OpenParsec.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction

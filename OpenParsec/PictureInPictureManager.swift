@@ -28,20 +28,40 @@ class PictureInPictureManager: NSObject {
 	private(set) var isPiPActive = false
 	private var isSetup = false
 	private(set) var isStarting = false
+	private var cancelRequestedWhileStarting = false
+	private var startSubmittedToAVKit = false
+	private var protectedGeneration: UInt64?
+	private var startToken: UInt64 = 0
 	private var frameCount: Int = 0
 	private let captureEveryNthFrame: Int = 2
+	private let captureLock = NSLock()
 
 	private var lastValidStreamWidth: GLsizei = 0
 	private var lastValidStreamHeight: GLsizei = 0
 
 	private weak var glkViewController: GLKViewController?
 
-	var onPiPStopped: (() -> Void)?
-	var onPiPStartFailed: (() -> Void)?
+	var onPiPStarted: ((UInt64) -> Void)?
+	var onPiPStopped: ((UInt64) -> Void)?
+	var onPiPStartFailed: ((UInt64) -> Void)?
 	var onRestoreUserInterface: (() -> Void)?
 
 	private override init() {
 		super.init()
+	}
+
+	private func makePiPController() -> AVPictureInPictureController? {
+		guard let layer = sampleBufferDisplayLayer else { return nil }
+		let contentSource = AVPictureInPictureController.ContentSource(
+			sampleBufferDisplayLayer: layer,
+			playbackDelegate: self
+		)
+		let controller = AVPictureInPictureController(contentSource: contentSource)
+		// Do not use the private `controlsStyle` KVC hook. It is not ABI-stable
+		// across iPadOS releases and has crashed inside AVKit on physical devices.
+		controller.delegate = self
+		controller.canStartPictureInPictureAutomaticallyFromInline = false
+		return controller
 	}
 
 	// MARK: - Setup
@@ -52,9 +72,6 @@ class PictureInPictureManager: NSObject {
 
 		self.glContext = glContext
 		self.glkViewController = glkViewController
-
-		try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
-		try? AVAudioSession.sharedInstance().setActive(true)
 
 		let layer = AVSampleBufferDisplayLayer()
 		layer.videoGravity = .resizeAspect
@@ -69,15 +86,7 @@ class PictureInPictureManager: NSObject {
 		self.sampleBufferDisplayLayer = layer
 		self.pipSourceView = containerView
 
-		let contentSource = AVPictureInPictureController.ContentSource(
-			sampleBufferDisplayLayer: layer,
-			playbackDelegate: self
-		)
-		let controller = AVPictureInPictureController(contentSource: contentSource)
-		controller.setValue(1, forKey: "controlsStyle")
-		controller.delegate = self
-		controller.canStartPictureInPictureAutomaticallyFromInline = false
-		self.pipController = controller
+		self.pipController = makePiPController()
 
 		setupTextureCache(glContext: glContext)
 
@@ -101,6 +110,12 @@ class PictureInPictureManager: NSObject {
 	// MARK: - Capture Surface
 
 	private func createCaptureSurface(width: GLsizei, height: GLsizei) {
+		var previousFBO: GLint = 0
+		glGetIntegerv(GLenum(GL_FRAMEBUFFER_BINDING), &previousFBO)
+		defer {
+			glBindFramebuffer(GLenum(GL_FRAMEBUFFER), GLenum(previousFBO))
+		}
+
 		destroyCaptureSurface()
 
 		guard let textureCache = textureCache else { return }
@@ -184,10 +199,23 @@ class PictureInPictureManager: NSObject {
 	// MARK: - Frame Capture (GL thread)
 
 	func captureFrame(viewWidth: GLsizei, viewHeight: GLsizei, streamWidth: GLsizei, streamHeight: GLsizei) {
+		captureLock.lock()
+		defer { captureLock.unlock() }
 		guard isSetup else { return }
+		guard ParsecPiPCapturePolicy.shouldCapture(
+			isActive: isPiPActive,
+			isStarting: isStarting,
+			hasPreparedSample: pixelBuffer != nil && cachedFormatDescription != nil
+		) else {
+			return
+		}
 
 		frameCount += 1
 		guard frameCount % captureEveryNthFrame == 0 else { return }
+
+		var currentFBO: GLint = 0
+		glGetIntegerv(GLenum(GL_FRAMEBUFFER_BINDING), &currentFBO)
+		guard currentFBO != 0 else { return }
 
 		if streamWidth >= 640 && streamHeight >= 480 && streamWidth <= 7680 && streamHeight <= 4320 {
 			if streamWidth != lastValidStreamWidth || streamHeight != lastValidStreamHeight {
@@ -204,10 +232,6 @@ class PictureInPictureManager: NSObject {
 		}
 
 		guard pixelBuffer != nil, captureFBO != 0 else { return }
-
-		var currentFBO: GLint = 0
-		glGetIntegerv(GLenum(GL_FRAMEBUFFER_BINDING), &currentFBO)
-		if currentFBO == 0 { return }
 
 		// Calculate the letterboxed stream region within the view
 		let sW = Float(lastValidStreamWidth > 0 ? lastValidStreamWidth : viewWidth)
@@ -296,34 +320,108 @@ class PictureInPictureManager: NSObject {
 
 	// MARK: - PiP Control
 
-	func startPiP() {
-		guard isSetup, let controller = pipController, !isPiPActive, !isStarting else { return }
+	func startPiP(generation: UInt64) {
+		guard !cancelRequestedWhileStarting else {
+			Diagnostics.note("pip-start result=skipped cancellation-pending=true")
+			return
+		}
+		captureLock.lock()
+		let setupReady = isSetup
+		let hasSampleBuffer = pixelBuffer != nil && cachedFormatDescription != nil
+		captureLock.unlock()
+		let hasController = pipController != nil
+		let hasAttachedSource = pipSourceView?.window != nil
+		let layerFailed = sampleBufferDisplayLayer?.status == .failed
+		let isReady = ParsecPiPStartPolicy.isReady(
+			isSetup: setupReady,
+			isActive: isPiPActive,
+			isStarting: isStarting,
+			hasController: hasController,
+			hasAttachedSource: hasAttachedSource,
+			hasSampleBuffer: hasSampleBuffer,
+			layerFailed: layerFailed
+		)
+		guard isReady, let controller = pipController else {
+			Diagnostics.note(
+				"pip-start result=skipped ready=false setup=\(setupReady) "
+				+ "active=\(isPiPActive) starting=\(isStarting) "
+				+ "controller=\(hasController) attached=\(hasAttachedSource) "
+				+ "sample=\(hasSampleBuffer) layerFailed=\(layerFailed)"
+			)
+			return
+		}
 
+		Diagnostics.note("pip-start result=attempt")
+		startToken &+= 1
+		let token = startToken
+		protectedGeneration = generation
+		cancelRequestedWhileStarting = false
+		startSubmittedToAVKit = false
 		isStarting = true
-		attemptStartPiP(controller: controller, retryCount: 0)
+		attemptStartPiP(controller: controller, retryCount: 0, token: token)
 	}
 
-	private func attemptStartPiP(controller: AVPictureInPictureController, retryCount: Int) {
+	private func attemptStartPiP(
+		controller: AVPictureInPictureController,
+		retryCount: Int,
+		token: UInt64
+	) {
 		if controller.isPictureInPicturePossible {
-			sampleBufferDisplayLayer?.flush()
+			// Keep the most recent sample queued. Starting PiP with a just-flushed
+			// display layer can leave AVKit with no valid presentation source.
+			startSubmittedToAVKit = true
 			controller.startPictureInPicture()
 		} else if retryCount < 5 {
 			DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-				guard let self = self, !self.isPiPActive, self.isStarting else {
-					self?.isStarting = false
+				guard let self = self,
+					  self.startToken == token,
+					  !self.isPiPActive,
+					  self.isStarting else {
 					return
 				}
-				self.attemptStartPiP(controller: controller, retryCount: retryCount + 1)
+				self.attemptStartPiP(
+					controller: controller,
+					retryCount: retryCount + 1,
+					token: token
+				)
 			}
 		} else {
-			isStarting = false
-			onPiPStartFailed?()
+			reportStartFailure(token: token)
 		}
 	}
 
-	func stopPiP() {
+	private func reportStartFailure(token: UInt64) {
+		guard token == startToken, let generation = protectedGeneration else { return }
+		startToken &+= 1
 		isStarting = false
-		guard isPiPActive else { return }
+		startSubmittedToAVKit = false
+		protectedGeneration = nil
+		onPiPStartFailed?(generation)
+	}
+
+	func stopPiP() {
+		startToken &+= 1
+		if isStarting {
+			let mustAwaitCallback = ParsecPiPTransitionPolicy.shouldLatchCancellation(
+				isStarting: true,
+				startSubmittedToAVKit: startSubmittedToAVKit
+			)
+			isStarting = false
+			cancelRequestedWhileStarting = mustAwaitCallback
+			protectedGeneration = nil
+			if mustAwaitCallback {
+				// AVKit may ignore this until didStart; that callback retries the stop.
+				pipController?.stopPictureInPicture()
+			} else {
+				startSubmittedToAVKit = false
+			}
+			return
+		}
+		cancelRequestedWhileStarting = false
+		guard isPiPActive else {
+			protectedGeneration = nil
+			return
+		}
 		pipController?.stopPictureInPicture()
 	}
 
@@ -331,31 +429,43 @@ class PictureInPictureManager: NSObject {
 
 	func teardown() {
 		stopPiP()
-		destroyCaptureSurface()
+		glkViewController?.isPaused = true
 
+		captureLock.lock()
+		let previousContext = EAGLContext.current()
+		if let glContext {
+			EAGLContext.setCurrent(glContext)
+		}
+		isSetup = false
+		destroyCaptureSurface()
 		if let cache = textureCache {
 			CVOpenGLESTextureCacheFlush(cache, 0)
 		}
+		EAGLContext.setCurrent(previousContext)
+		captureLock.unlock()
+
 		textureCache = nil
 		pipController = nil
 		sampleBufferDisplayLayer?.removeFromSuperlayer()
 		sampleBufferDisplayLayer = nil
 		pipSourceView?.removeFromSuperview()
 		pipSourceView = nil
+		glkViewController = nil
 		glContext = nil
-		isSetup = false
 		isPiPActive = false
 		isStarting = false
+		cancelRequestedWhileStarting = false
+		startSubmittedToAVKit = false
+		protectedGeneration = nil
+		startToken &+= 1
 		lastValidStreamWidth = 0
 		lastValidStreamHeight = 0
 		cachedFormatDescription = nil
+		onPiPStarted = nil
 		onPiPStopped = nil
 		onPiPStartFailed = nil
 		onRestoreUserInterface = nil
 
-		// Deactivate the audio session so iOS stops keeping the app alive
-		// for audio playback in the background
-		try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
 	}
 }
 
@@ -364,34 +474,81 @@ class PictureInPictureManager: NSObject {
 extension PictureInPictureManager: AVPictureInPictureControllerDelegate {
 
 	func pictureInPictureControllerWillStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
-		isPiPActive = true
-		isStarting = false
-		// Keep GL render loop alive during PiP so frames keep updating
+		guard pictureInPictureController === pipController else {
+			pictureInPictureController.stopPictureInPicture()
+			return
+		}
+		guard isStarting else {
+			pictureInPictureController.stopPictureInPicture()
+			return
+		}
+		// Keep GL rendering ready during the AVKit transition, but do not mark
+		// the session protected until didStart confirms PiP is actually active.
 		glkViewController?.isPaused = false
 	}
 
 	func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+		let action = ParsecPiPTransitionPolicy.didStartAction(
+			isExpectedController: pictureInPictureController === pipController,
+			isStarting: isStarting,
+			cancelRequestedWhileStarting: cancelRequestedWhileStarting
+		)
+		switch action {
+		case .activateProtection:
+			isPiPActive = true
+			isStarting = false
+			startSubmittedToAVKit = false
+			if let generation = protectedGeneration {
+				onPiPStarted?(generation)
+			}
+		case .stopWithoutProtection:
+			cancelRequestedWhileStarting = false
+			startSubmittedToAVKit = false
+			isStarting = false
+			isPiPActive = true
+			protectedGeneration = nil
+			pictureInPictureController.stopPictureInPicture()
+		case .ignore:
+			break
+		}
 	}
 
 	func pictureInPictureControllerWillStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
 	}
 
 	func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+		guard pictureInPictureController === pipController else { return }
 		isPiPActive = false
-		onPiPStopped?()
+		isStarting = false
+		cancelRequestedWhileStarting = false
+		startSubmittedToAVKit = false
+		guard let generation = protectedGeneration else { return }
+		protectedGeneration = nil
+		onPiPStopped?(generation)
 	}
 
 	func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
 									restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
+		guard pictureInPictureController === pipController else {
+			completionHandler(false)
+			return
+		}
 		onRestoreUserInterface?()
 		completionHandler(true)
 	}
 
 	func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
 									failedToStartPictureInPictureWithError error: Error) {
+		guard pictureInPictureController === pipController else { return }
 		isPiPActive = false
-		isStarting = false
-		onPiPStartFailed?()
+		if cancelRequestedWhileStarting {
+			cancelRequestedWhileStarting = false
+			startSubmittedToAVKit = false
+			isStarting = false
+			protectedGeneration = nil
+			return
+		}
+		reportStartFailure(token: startToken)
 	}
 }
 

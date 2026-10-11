@@ -1,10 +1,9 @@
-import ParsecSDK
 import UIKit
 
 
 class TouchController
 {
-	let viewController: UIViewController
+	weak var viewController: UIViewController?
 
 	init(viewController: UIViewController) {
 		self.viewController = viewController
@@ -16,15 +15,23 @@ class TouchController
 		let y = Int32(location.y)
 
 		// Send the mouse input to the host
-		let parsecTap = ParsecMouseButton(rawValue: UInt32(typeOfTap))
+		let parsecTap = RemoteMouseButton(rawValue: UInt32(typeOfTap))
 		switch state
 		{
 			case .began:
 				CParsec.sendMouseMessage(parsecTap, x, y, true)
 			case .changed:
 				CParsec.sendMousePosition(x, y)
-			case .ended, .cancelled:
+			case .ended:
 				CParsec.sendMouseMessage(parsecTap, x, y, false)
+			case .cancelled:
+				CParsec.sendMouseMessage(
+					parsecTap,
+					x,
+					y,
+					false,
+					releaseReason: .gestureCancelled
+				)
 			default:
 				break
 		}
@@ -32,7 +39,11 @@ class TouchController
 
 	func onTap(typeOfTap:Int, location:CGPoint) {
 
-		let parsecTap = ParsecMouseButton(rawValue: UInt32(typeOfTap))
+		let parsecTap = RemoteMouseButton(rawValue: UInt32(typeOfTap))
+		// A quick second tap can land before the previous tap's delayed
+		// release; release it now so the latch doesn't swallow this press.
+		// The stale delayed release then becomes a no-op or an early release.
+		CParsec.sendMouseClickMessage(parsecTap, false)
 
 		if SettingsHandler.cursorMode == .direct {
 			let x = Int32(location.x)
