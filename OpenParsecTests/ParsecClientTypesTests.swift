@@ -1838,12 +1838,15 @@ final class ParsecClientTypesTests: XCTestCase {
 
     // Each suspend/resume flip must change the config decode_thread compares
     // (that is what drops the VT decoder) and end on the user's value.
-    func testVideoSuspendFlipsDecoderCompatibilityAndRestoresIt() {
+    // Each resume toggles the inert compatibility field so decode_thread
+    // drops a possibly invalid decoder; consecutive resumes alternate.
+    func testEachResumeChangesTheDecoderConfig() {
         for user in [false, true] {
-            let suspended = ParsecVideoSuspendPolicy.decoderCompatibility(user: user, suspended: true)
-            let resumed = ParsecVideoSuspendPolicy.decoderCompatibility(user: user, suspended: false)
-            XCTAssertNotEqual(suspended, user)
-            XCTAssertEqual(resumed, user)
+            let first = ParsecVideoSuspendPolicy.decoderCompatibility(user: user, flipped: true)
+            let second = ParsecVideoSuspendPolicy.decoderCompatibility(user: user, flipped: false)
+            XCTAssertNotEqual(first, user)
+            XCTAssertEqual(second, user)
+            XCTAssertNotEqual(first, second)
         }
     }
 
@@ -1877,6 +1880,22 @@ final class ParsecClientTypesTests: XCTestCase {
             ),
             .terminal(generation: 3, status: RemoteStatus(rawValue: -14))
         )
+    }
+
+    func testResolutionMenuLabelsNameRealSizesAndIPadFit() {
+        let iPad = (width: 2420, height: 1668)
+        XCTAssertEqual(ParsecResolution.menuLabel(for: .client, iPad: iPad, hostNative: nil, hostIsMac: false),
+                       "iPad native (2420×1668)")
+        XCTAssertEqual(ParsecResolution.menuLabel(for: .host, iPad: iPad, hostNative: (3024, 1964), hostIsMac: true),
+                       "Host native (Mac 3024×1964) · scaled, black bars")
+        XCTAssertEqual(ParsecResolution.menuLabel(for: .host, iPad: iPad, hostNative: nil, hostIsMac: false),
+                       "Host native (host's own resolution)")
+        XCTAssertEqual(ParsecResolution.menuLabel(for: .r1920x1080_16_9, iPad: iPad, hostNative: nil, hostIsMac: false),
+                       "1920x1080 (16:9) · scaled, black bars")
+        XCTAssertEqual(ParsecResolution.menuLabel(for: .r1920x1080_16_9, iPad: iPad, hostNative: nil, hostIsMac: true),
+                       "1920x1080 (16:9) · Mac sends native")
+        XCTAssertEqual(ParsecResolution.menuLabel(for: .host, iPad: iPad, hostNative: (2420, 1668), hostIsMac: false),
+                       "Host native (2420×1668) · 1:1 on iPad")
     }
 
     func testDisplayToggleTargetsTheOtherOfTwoMonitors() {

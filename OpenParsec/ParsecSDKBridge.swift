@@ -39,6 +39,7 @@ class ParsecSDKBridge: ParsecService
 	public var pngCursor: Bool = false
 	// See ParsecVideoSuspendPolicy. Guarded by CParsec.lifecycleLock.
 	private var videoSuspended = false
+	private var decoderFlipped = false
 	private var videoResume: (at: CFAbsoluteTime, decodeLatency: Float, nudged: Bool)?
 	// Pollers and the input gate share one condition. A reconnect must drain
 	// both SDK poll calls before ParsecClientDisconnect and cannot start a new
@@ -236,6 +237,7 @@ class ParsecSDKBridge: ParsecService
 
 		// A new decode_thread starts with a fresh decoder and an unpaused host.
 		videoSuspended = false
+		decoderFlipped = false
 		videoResume = nil
 
 		var parsecClientCfg = ParsecClientConfig()
@@ -648,7 +650,7 @@ class ParsecSDKBridge: ParsecService
 		// picker did nothing.
 		let compatibility = ParsecVideoSuspendPolicy.decoderCompatibility(
 			user: SettingsHandler.decoderCompatibility,
-			suspended: videoSuspended
+			flipped: decoderFlipped
 		)
 		parsecClientCfg.video.0.decoderIndex = 1
 		parsecClientCfg.video.0.resolutionX = Int32(SettingsHandler.resolution.width)
@@ -678,18 +680,26 @@ class ParsecSDKBridge: ParsecService
 		}
 		videoSuspended = suspended
 		if suspended {
-			// Pause first: the decoder reset's keyframe request (msg 0xd) is
-			// sent by decode_thread up to 100 ms later, behind this message.
-			let result = RemoteStatus(ParsecClientPause(_parsec, true, false))
-			applyConfig() // park: in-flight frames are dropped, not decoded
+			// Stop the video stream itself while away. Device log 12:51:26: with
+			// only Pause + a decoder reset, the macOS host kept streaming, the
+			// reset's keyframe rebuilt the decoder and the next frame was decoded
+			// in the background → vt_callback -14 → decode thread dead. A
+			// disabled stream delivers nothing, so nothing is decoded and no
+			// keyframe is requested until we come back.
+			let pause = RemoteStatus(ParsecClientPause(_parsec, true, false))
+			let disable = RemoteStatus(ParsecClientEnableStream(_parsec, UInt8(DEFAULT_STREAM), false))
 			videoResume = nil
-			Diagnostics.note("video-pause event=\(event) result=\(result.rawValue)")
-			Diagnostics.note("decoder-recovery event=parked")
+			Diagnostics.note("video-pause event=\(event) result=\(pause.rawValue) stream=\(disable.rawValue)")
 			return
 		}
-		// Park before resuming: decode_thread checks the config after each
-		// receive, so the stale VT session is gone before any resumed frame.
+		// Force a fresh decoder before any resumed frame: the VT session from
+		// before the app switch may be invalid. The config change makes
+		// decode_thread drop it on its next pass and wait for a keyframe,
+		// which the re-enabled stream starts with.
+		decoderFlipped.toggle()
 		applyConfig()
+		let enable = RemoteStatus(ParsecClientEnableStream(_parsec, UInt8(DEFAULT_STREAM), true))
+		Diagnostics.note("video-stream event=enable result=\(enable.rawValue)")
 		var status = ParsecClientStatus()
 		ParsecClientGetStatus(_parsec, &status)
 		videoResume = (CFAbsoluteTimeGetCurrent(), status.`self`.metrics.0.decodeLatency, false)

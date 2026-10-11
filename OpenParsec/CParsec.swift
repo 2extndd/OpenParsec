@@ -128,8 +128,42 @@ enum ParsecResolution: String, CaseIterable, Hashable {
 		}
 	}
 
+	// Menu label: names the real pixel sizes and says how each choice lands on
+	// the iPad. The persisted value stays rawValue.
 	var desc: String {
-		return rawValue
+		let host = CParsec.parsecImpl.map { (Int($0.hostWidth), Int($0.hostHeight)) } ?? (0, 0)
+		return Self.menuLabel(
+			for: self,
+			iPad: Self.clientSize,
+			hostNative: host.0 > 0 && host.1 > 0 ? host : nil,
+			hostIsMac: CParsec.hostOS == .macos
+		)
+	}
+
+	static func menuLabel(
+		for resolution: ParsecResolution,
+		iPad: (width: Int, height: Int),
+		hostNative: (Int, Int)?,
+		hostIsMac: Bool
+	) -> String {
+		func fit(_ w: Int, _ h: Int) -> String {
+			if w == iPad.width && h == iPad.height { return "1:1 on iPad" }
+			let sameAspect = abs(Double(w) / Double(h) - Double(iPad.width) / Double(iPad.height)) < 0.01
+			return sameAspect ? "scaled to iPad" : "scaled, black bars"
+		}
+		switch resolution {
+		case .client:
+			return "iPad native (\(iPad.width)×\(iPad.height))"
+		case .host:
+			guard let native = hostNative else { return "Host native (host's own resolution)" }
+			let (w, h) = native
+			return "Host native (\(hostIsMac ? "Mac " : "")\(w)×\(h)) · \(fit(w, h))"
+		default:
+			// A macOS host can't switch display modes (vp_supported=0): it always
+			// streams its native size, whatever is requested.
+			if hostIsMac { return resolution.rawValue + " · Mac sends native" }
+			return resolution.rawValue + " · " + fit(resolution.width, resolution.height)
+		}
 	}
 
 	static var resolutions: [ParsecResolution] {

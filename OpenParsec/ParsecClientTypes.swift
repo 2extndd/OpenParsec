@@ -828,10 +828,13 @@ enum ParsecVideoSuspendPolicy {
     static let nudgeAfter: TimeInterval = 1.0
     static let stallAfter: TimeInterval = 3.0
 
-    /// Flip while suspended and again on resume: each flip drops the decoder,
-    /// and the setting is back to the user's value afterwards.
-    static func decoderCompatibility(user: Bool, suspended: Bool) -> Bool {
-        user != suspended
+    /// decoderCompatibility is inert for the VideoToolbox decoder (vt_init_hw
+    /// ignores it), but decode_thread drops its decoder whenever the config
+    /// changes. Toggling `flipped` on every resume therefore forces a fresh
+    /// decoder (rebuilt from the next keyframe, in the foreground) without
+    /// a second reset to restore the user's value.
+    static func decoderCompatibility(user: Bool, flipped: Bool) -> Bool {
+        user != flipped
     }
 
     /// `decoded`: metrics.decodeLatency changed since resume. decode_thread

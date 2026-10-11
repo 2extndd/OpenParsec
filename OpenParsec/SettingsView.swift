@@ -124,7 +124,7 @@ struct SettingsView:View
 							{
 								MultiPicker(selection: $preferredFramesPerSecond, options:
 								[
-								Choice("Auto (Device Max)", 0),
+								Choice("Auto (\(UIScreen.main.maximumFramesPerSecond) Hz)", 0),
 								Choice("120 FPS", 120),
 								Choice("60 FPS", 60),
 								Choice("30 FPS", 30)
