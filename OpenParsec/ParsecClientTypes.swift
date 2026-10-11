@@ -796,15 +796,58 @@ struct ParsecTransportRecoverySnapshot: Equatable, Sendable {
     }
 }
 
-/// DECODE_ERR_* (-10…-23). The SDK latches it in GetStatus until the next
-/// connect/disconnect (parsec.h), and nothing observable proves the decoder
-/// came back: the pre-render callback fires on every RenderFrame call, re-draws
-/// included (ParsecSDK 0x7ccf0). After iPadOS invalidates the VideoToolbox
-/// session in the background, vt_decode_frame returns -14 and the picture
-/// stays frozen, so a decode error is always a dead decoder.
+/// DECODE_ERR_* (-10…-23). A decode error is a dead video pipeline, not a
+/// latch to wait out (ParsecSDK arm64): vt_decode_frame (0x82b7c) maps any
+/// VTDecompressionSessionDecodeFrame failure to -14 (0x82d88); decode_thread
+/// stores it as the stream status (0x7dfb8) and exits on its next loop check
+/// (0x7dd70 → 0x7e704). Only ParsecClientConnect starts a new decode_thread,
+/// so the reconnect is the only remedy once this status appears.
 enum ParsecDecodeErrorPolicy {
     static func isDecodeError(_ status: RemoteStatus) -> Bool {
         (-23 ... -10).contains(status.rawValue)
+    }
+}
+
+/// Keeps the VideoToolbox session from ever decoding after iPadOS invalidated
+/// it (see ParsecDecodeErrorPolicy for why that is fatal). Evidence:
+/// - ParsecClientPause (0x7a7c4) only sends msg 0x16 {video, audio}; it does
+///   not touch the client decoder. The SDK host marks a resumed guest for an
+///   encoder reinit/keyframe (0x7f524).
+/// - decode_thread compares the pending ParsecClientSetConfig fields with the
+///   applied ones each loop (0x7ddd0). On a change it destroys the decoder
+///   (0x7df30) and sends msg 0xd with reset=1 (0x7ded4); the SDK host answers
+///   that with a keyframe (0x7f230). Until a frame with SPS/VPS rebuilds the
+///   decoder (0x7e0b8), other frames are dropped without error (0x7e29c).
+/// - vt_init_hw (0x82558) ignores decoderCompatibility, so flipping it resets
+///   the decoder and changes nothing else.
+enum ParsecVideoSuspendPolicy {
+    enum Recovery: Equatable {
+        case waiting, recovered, failed, nudge, stalled
+    }
+
+    static let nudgeAfter: TimeInterval = 1.0
+    static let stallAfter: TimeInterval = 3.0
+
+    /// Flip while suspended and again on resume: each flip drops the decoder,
+    /// and the setting is back to the user's value afterwards.
+    static func decoderCompatibility(user: Bool, suspended: Bool) -> Bool {
+        user != suspended
+    }
+
+    /// `decoded`: metrics.decodeLatency changed since resume. decode_thread
+    /// writes it only after a successful decode (0x7e360…0x7e388), while
+    /// GLRenderFrame returns OK for re-draws too (0x7ce98).
+    static func recovery(
+        elapsed: TimeInterval,
+        decoded: Bool,
+        status: RemoteStatus,
+        nudged: Bool
+    ) -> Recovery {
+        if ParsecDecodeErrorPolicy.isDecodeError(status) { return .failed }
+        if decoded { return .recovered }
+        if elapsed >= stallAfter { return .stalled }
+        if elapsed >= nudgeAfter && !nudged { return .nudge }
+        return .waiting
     }
 }
 

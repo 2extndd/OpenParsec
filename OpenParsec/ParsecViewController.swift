@@ -727,11 +727,16 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		// Otherwise GLK autoresizing can publish portrait/ultrawide dimensions
 		// to the SDK while the app is leaving the foreground.
 		glkView?.cleanUp()
+		// Stop video before iPadOS can invalidate VideoToolbox: one decode on a
+		// dead session kills the SDK decode thread (ParsecVideoSuspendPolicy).
+		CParsec.setVideoSuspended(true)
 		// keyboardWillHide fires while backgrounding; remember the user's choice.
 		keyboardWasVisibleBeforeResign = keyboardVisible
 	}
 
 	@objc private func appDidBecomeActive() {
+		// Fresh decoder + keyframe, no reconnect (ParsecVideoSuspendPolicy).
+		CParsec.setVideoSuspended(false)
 		// App-switch gestures can leave UIScrollView's pinch/offset in an
 		// intermediate zoom. At zoom > 1, scroll is intentionally consumed
 		// locally instead of reaching the host, which looks like dead input.

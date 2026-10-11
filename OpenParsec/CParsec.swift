@@ -230,10 +230,14 @@ protocol ParsecSessionServicing {
 	func sendUserData(type: ParsecUserDataType, message: Data)
 	func updateHostVideoConfig()
 	var isAudioKeepAliveActive: Bool { get }
+	/// Pauses host video and parks the decoder across a resign-active window
+	/// (see ParsecVideoSuspendPolicy). Audio keeps flowing.
+	func setVideoSuspended(_ suspended: Bool)
 }
 
 extension ParsecSessionServicing {
 	var isAudioKeepAliveActive: Bool { false }
+	func setVideoSuspended(_ suspended: Bool) {}
 }
 
 protocol ParsecRenderingServicing {
@@ -733,6 +737,13 @@ class CParsec
 	
 	static func updateHostVideoConfig() {
 		parsecImpl.updateHostVideoConfig()
+	}
+
+	static func setVideoSuspended(_ suspended: Bool) {
+		// Same lock as getStatusEx, which drives the resume recovery check.
+		lifecycleLock.lock()
+		defer { lifecycleLock.unlock() }
+		parsecImpl.setVideoSuspended(suspended)
 	}
 
 	static func sendMouseMessage(

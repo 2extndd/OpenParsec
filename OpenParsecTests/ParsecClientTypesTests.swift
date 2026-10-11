@@ -1836,6 +1836,37 @@ final class ParsecClientTypesTests: XCTestCase {
         )
     }
 
+    // Each suspend/resume flip must change the config decode_thread compares
+    // (that is what drops the VT decoder) and end on the user's value.
+    func testVideoSuspendFlipsDecoderCompatibilityAndRestoresIt() {
+        for user in [false, true] {
+            let suspended = ParsecVideoSuspendPolicy.decoderCompatibility(user: user, suspended: true)
+            let resumed = ParsecVideoSuspendPolicy.decoderCompatibility(user: user, suspended: false)
+            XCTAssertNotEqual(suspended, user)
+            XCTAssertEqual(resumed, user)
+        }
+    }
+
+    func testVideoResumeRecoveryWaitsNudgesThenFallsBackToReconnect() {
+        typealias P = ParsecVideoSuspendPolicy
+        let ok = RemoteStatus.ok
+        XCTAssertEqual(P.recovery(elapsed: 0.2, decoded: false, status: ok, nudged: false), .waiting)
+        XCTAssertEqual(P.recovery(elapsed: 0.2, decoded: true, status: ok, nudged: false), .recovered)
+        XCTAssertEqual(P.recovery(elapsed: P.nudgeAfter, decoded: false, status: ok, nudged: false), .nudge)
+        XCTAssertEqual(P.recovery(elapsed: P.nudgeAfter, decoded: false, status: ok, nudged: true), .waiting)
+        XCTAssertEqual(P.recovery(elapsed: P.stallAfter, decoded: false, status: ok, nudged: true), .stalled)
+        // A late frame still counts as recovery, never as a stall.
+        XCTAssertEqual(P.recovery(elapsed: 10, decoded: true, status: ok, nudged: true), .recovered)
+        // A real decode error is already fatal (decode_thread exited).
+        XCTAssertEqual(
+            P.recovery(elapsed: 0.1, decoded: true, status: RemoteStatus(rawValue: -14), nudged: false),
+            .failed
+        )
+        // The stall is reported as a decode error, so the existing monitor
+        // performs the one last-resort reconnect.
+        XCTAssertTrue(ParsecDecodeErrorPolicy.isDecodeError(RemoteStatus(rawValue: -14)))
+    }
+
     func testDecodeErrorOnUnfinishedReplacementIsTerminal() {
         var monitor = ParsecTransportRecoveryMonitor(failureThreshold: 5)
         XCTAssertEqual(

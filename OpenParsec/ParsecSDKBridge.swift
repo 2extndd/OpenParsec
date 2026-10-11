@@ -37,6 +37,9 @@ class ParsecSDKBridge: ParsecService
 	public var netProtocol: Int32 = 1
 	public var mediaContainer: Int32 = 0
 	public var pngCursor: Bool = false
+	// See ParsecVideoSuspendPolicy. Guarded by CParsec.lifecycleLock.
+	private var videoSuspended = false
+	private var videoResume: (at: CFAbsoluteTime, decodeLatency: Float, nudged: Bool)?
 	// Pollers and the input gate share one condition. A reconnect must drain
 	// both SDK poll calls before ParsecClientDisconnect and cannot start a new
 	// pair until ParsecClientConnect has accepted the replacement session.
@@ -231,6 +234,10 @@ class ParsecSDKBridge: ParsecService
 			}
 		}
 
+		// A new decode_thread starts with a fresh decoder and an unpaused host.
+		videoSuspended = false
+		videoResume = nil
+
 		var parsecClientCfg = ParsecClientConfig()
 		parsecClientCfg.video.0.decoderIndex = 1
         // Use saved resolution from SettingsHandler
@@ -263,6 +270,7 @@ class ParsecSDKBridge: ParsecService
 	func disconnect() {
 
 		resetMediaReadiness()
+		videoResume = nil
 		stopBackgroundTaskAndWait()
 		audioWanted = false
 		// setActive can block 10–100+ ms: off the main thread, on the same
@@ -307,7 +315,7 @@ class ParsecSDKBridge: ParsecService
 		self.hostWidth = Float(decoder.width)
 
 		return RemoteClientStatus(
-			status: RemoteStatus(result),
+			status: checkVideoResume(RemoteStatus(result), decodeLatency: metrics.decodeLatency),
 			metrics: RemoteClientMetrics(
 				decodeLatency: Double(metrics.decodeLatency),
 				encodeLatency: Double(metrics.encodeLatency),
@@ -638,16 +646,20 @@ class ParsecSDKBridge: ParsecService
 		// 0/0 (= "use host default"), which silently overwrote whatever
 		// connect() had set, making it look like the in-overlay Resolution
 		// picker did nothing.
+		let compatibility = ParsecVideoSuspendPolicy.decoderCompatibility(
+			user: SettingsHandler.decoderCompatibility,
+			suspended: videoSuspended
+		)
 		parsecClientCfg.video.0.decoderIndex = 1
 		parsecClientCfg.video.0.resolutionX = Int32(SettingsHandler.resolution.width)
 		parsecClientCfg.video.0.resolutionY = Int32(SettingsHandler.resolution.height)
-		parsecClientCfg.video.0.decoderCompatibility = SettingsHandler.decoderCompatibility
+		parsecClientCfg.video.0.decoderCompatibility = compatibility
 		parsecClientCfg.video.0.decoderH265 = SettingsHandler.decoder == .h265
 
 		parsecClientCfg.video.1.decoderIndex = 1
 		parsecClientCfg.video.1.resolutionX = Int32(SettingsHandler.resolution.width)
 		parsecClientCfg.video.1.resolutionY = Int32(SettingsHandler.resolution.height)
-		parsecClientCfg.video.1.decoderCompatibility = SettingsHandler.decoderCompatibility
+		parsecClientCfg.video.1.decoderCompatibility = compatibility
 		parsecClientCfg.video.1.decoderH265 = SettingsHandler.decoder == .h265
 
 		parsecClientCfg.mediaContainer = mediaContainer
@@ -656,6 +668,70 @@ class ParsecSDKBridge: ParsecService
 		parsecClientCfg.pngCursor = pngCursor
 
 		ParsecClientSetConfig(_parsec, &parsecClientCfg);
+	}
+
+	func setVideoSuspended(_ suspended: Bool) {
+		let event = suspended ? "suspend" : "resume"
+		guard backgroundTaskRunning, suspended != videoSuspended else {
+			Diagnostics.note("video-pause event=\(event) result=skipped connected=\(backgroundTaskRunning) suspended=\(videoSuspended)")
+			return
+		}
+		videoSuspended = suspended
+		if suspended {
+			// Pause first: the decoder reset's keyframe request (msg 0xd) is
+			// sent by decode_thread up to 100 ms later, behind this message.
+			let result = RemoteStatus(ParsecClientPause(_parsec, true, false))
+			applyConfig() // park: in-flight frames are dropped, not decoded
+			videoResume = nil
+			Diagnostics.note("video-pause event=\(event) result=\(result.rawValue)")
+			Diagnostics.note("decoder-recovery event=parked")
+			return
+		}
+		// Park before resuming: decode_thread checks the config after each
+		// receive, so the stale VT session is gone before any resumed frame.
+		applyConfig()
+		var status = ParsecClientStatus()
+		ParsecClientGetStatus(_parsec, &status)
+		videoResume = (CFAbsoluteTimeGetCurrent(), status.`self`.metrics.0.decodeLatency, false)
+		let result = RemoteStatus(ParsecClientPause(_parsec, false, false))
+		Diagnostics.note("video-pause event=\(event) result=\(result.rawValue)")
+		Diagnostics.note("decoder-recovery event=awaiting-keyframe")
+	}
+
+	/// Resume follow-up, driven by the session poll. Returns the status the
+	/// transport monitor should see: a stalled resume is reported as -14 so the
+	/// existing decode-error reconnect stays the last resort.
+	private func checkVideoResume(_ status: RemoteStatus, decodeLatency: Float) -> RemoteStatus {
+		guard let resume = videoResume else { return status }
+		let elapsed = CFAbsoluteTimeGetCurrent() - resume.at
+		let ms = Int(elapsed * 1000)
+		switch ParsecVideoSuspendPolicy.recovery(
+			elapsed: elapsed,
+			decoded: decodeLatency != resume.decodeLatency,
+			status: status,
+			nudged: resume.nudged
+		) {
+		case .waiting:
+			return status
+		case .recovered:
+			videoResume = nil
+			Diagnostics.note("decoder-recovery event=first-frame ms=\(ms) decodeMs=\(String(format: "%.1f", decodeLatency))")
+			return status
+		case .failed:
+			videoResume = nil
+			Diagnostics.note("decoder-recovery event=failed ms=\(ms) status=\(status.rawValue)")
+			return status
+		case .nudge:
+			videoResume?.nudged = true
+			Diagnostics.note("decoder-recovery event=nudge ms=\(ms) action=video-config-push")
+			// Host restarts capture/encoder on this push → fresh keyframe.
+			DispatchQueue.main.async { self.updateHostVideoConfig() }
+			return status
+		case .stalled:
+			videoResume = nil
+			Diagnostics.note("decoder-recovery event=stalled ms=\(ms) action=reconnect")
+			return RemoteStatus(rawValue: -14)
+		}
 	}
 	
 	// All outgoing-input methods gate on backgroundTaskRunning. False means
