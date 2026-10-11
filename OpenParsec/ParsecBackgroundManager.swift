@@ -438,6 +438,17 @@ class ParsecBackgroundManager {
         lock.unlock()
     }
 
+    /// Foreground decoder-loss recovery reconnects to the same host/output, so
+    /// keep the session view up exactly like a background return does. The
+    /// replacement generation's connectionDidStart clears it.
+    func preserveSessionPresentation(generation: UInt64) {
+        lock.lock()
+        if activeConnection, generation == lastConnectionGeneration {
+            presentationPreservingBackgroundGeneration = generation
+        }
+        lock.unlock()
+    }
+
     /// - Parameter audioKeepAlive: the session's audio queue is playing, so
     ///   iPadOS keeps the process (and the SDK connection) running in the
     ///   background; no ~30 s task assertion is needed and the grace window

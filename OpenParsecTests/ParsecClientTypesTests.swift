@@ -1802,15 +1802,50 @@ final class ParsecClientTypesTests: XCTestCase {
 
     // Users still on the old ⌃Space default move to ⌘Space once (macOS
     // input-source switch; Win+Space on Windows); explicit choices stick.
-    // Device log 10:43: a 1 s app switch left GetStatus at -14 while frames
-    // kept flowing, and the monitor forced a full reconnect (freeze + display
-    // restore). Decode errors count only once frames actually stop.
-    func testStickyDecodeErrorIsHealthyWhileFramesFlow() {
-        let decode = RemoteStatus(rawValue: -14)
-        XCTAssertEqual(ParsecDecodeErrorPolicy.effectiveStatus(decode, secondsSinceNewFrame: 0.1), .ok)
-        XCTAssertEqual(ParsecDecodeErrorPolicy.effectiveStatus(decode, secondsSinceNewFrame: 4), decode)
-        let nat = RemoteStatus(rawValue: -6023)
-        XCTAssertEqual(ParsecDecodeErrorPolicy.effectiveStatus(nat, secondsSinceNewFrame: 0.1), nat)
+    // Device log 11:36: -14 after a background return was "tolerated" because
+    // the pre-render callback (which fires on re-draws too) looked like live
+    // frames; the picture froze forever. A decode error is never healthy.
+    func testDecodeErrorRangeIsExactlyDecoderStatuses() {
+        for raw: Int32 in -23 ... -10 {
+            XCTAssertTrue(ParsecDecodeErrorPolicy.isDecodeError(RemoteStatus(rawValue: raw)))
+        }
+        for raw: Int32 in [-24, -9, -6, -3, 0, 20, 1003, -6023, -12007] {
+            XCTAssertFalse(ParsecDecodeErrorPolicy.isDecodeError(RemoteStatus(rawValue: raw)))
+        }
+    }
+
+    func testDecodeErrorReconnectsOnFirstPollWithoutStreak() {
+        var monitor = ParsecTransportRecoveryMonitor(failureThreshold: 5)
+        XCTAssertEqual(
+            monitor.observe(
+                status: RemoteStatus(rawValue: -14),
+                generation: 2,
+                isReplacementGeneration: false
+            ),
+            .reconnect(generation: 2)
+        )
+        XCTAssertEqual(monitor.snapshot.phase, .reconnectRequested)
+        // Transport failures still need the full streak.
+        var transport = ParsecTransportRecoveryMonitor(failureThreshold: 5)
+        XCTAssertNil(
+            transport.observe(
+                status: RemoteStatus(rawValue: -6023),
+                generation: 2,
+                isReplacementGeneration: false
+            )
+        )
+    }
+
+    func testDecodeErrorOnUnfinishedReplacementIsTerminal() {
+        var monitor = ParsecTransportRecoveryMonitor(failureThreshold: 5)
+        XCTAssertEqual(
+            monitor.observe(
+                status: RemoteStatus(rawValue: -14),
+                generation: 3,
+                isReplacementGeneration: true
+            ),
+            .terminal(generation: 3, status: RemoteStatus(rawValue: -14))
+        )
     }
 
     func testDisplayToggleTargetsTheOtherOfTwoMonitors() {
@@ -2513,5 +2548,98 @@ final class ParsecConnectionTestTests: XCTestCase {
         let echo = try JSONDecoder().decode(ParsecUserDataVideoConfig.self, from: JSONEncoder().encode(config))
         XCTAssertEqual(echo.video[0].output, "2")
         XCTAssertTrue(echo.video[0].fullFPS)
+    }
+
+    // MARK: - Stream geometry (aspect-fit)
+
+    func testAspectFitMatchesDeviceViewportForMacHostOnIPadPro11() {
+        // Device log: 3024x1964 stream, 1408x970 pt view at 1.7196 →
+        // GL viewport 0,48,2421,1572.
+        let scale: CGFloat = 1.7195876288659795
+        let fit = ParsecResolution.aspectFit(
+            CGSize(width: 3024, height: 1964),
+            in: CGSize(width: 1408, height: 970)
+        )
+        XCTAssertEqual(fit.minX, 0, accuracy: 0.001)
+        XCTAssertEqual(fit.width * scale, 2421, accuracy: 1)
+        XCTAssertEqual(fit.height * scale, 1572, accuracy: 1)
+        XCTAssertEqual(fit.minY * scale, 48, accuracy: 1)
+    }
+
+    func testAspectFitLetterboxesEveryResolutionOnEveryScreenWithoutStretchOrCrop() {
+        let screens: [CGSize] = [
+            CGSize(width: 1408, height: 970),  // iPad Pro 11" M4, More Space
+            CGSize(width: 1210, height: 834),  // iPad Pro 11" default
+            CGSize(width: 834, height: 1210),  // portrait
+            CGSize(width: 1376, height: 1032), // iPad Pro 13"
+            CGSize(width: 1133, height: 744),  // iPad mini
+            CGSize(width: 1408, height: 600),  // shortened (keyboard / window)
+            CGSize(width: 700, height: 700),
+        ]
+        var streams = ParsecResolution.allCases
+            .filter { $0 != .host }
+            .map { CGSize(width: $0.width, height: $0.height) }
+        streams += [
+            CGSize(width: 3024, height: 1964), // MacBook Pro 14" host
+            CGSize(width: 2560, height: 1664), // MacBook Air 13"
+            CGSize(width: 5120, height: 1440), // 32:9
+            CGSize(width: 1080, height: 1920), // portrait host
+            CGSize(width: 2421, height: 1668), // client-sized
+        ]
+        for screen in screens {
+            for stream in streams {
+                let fit = ParsecResolution.aspectFit(stream, in: screen)
+                let label = "\(stream) in \(screen)"
+                // Never cropped: inside the view.
+                XCTAssertGreaterThanOrEqual(fit.minX, -0.001, label)
+                XCTAssertGreaterThanOrEqual(fit.minY, -0.001, label)
+                XCTAssertLessThanOrEqual(fit.maxX, screen.width + 0.001, label)
+                XCTAssertLessThanOrEqual(fit.maxY, screen.height + 0.001, label)
+                // Never stretched: same aspect as the stream.
+                XCTAssertEqual(fit.width / fit.height, stream.width / stream.height, accuracy: 1e-9, label)
+                // As large as possible: fills one axis completely.
+                XCTAssertTrue(
+                    abs(fit.width - screen.width) < 0.001 || abs(fit.height - screen.height) < 0.001,
+                    label
+                )
+                // Centred: equal bars on both sides.
+                XCTAssertEqual(fit.minX, screen.width - fit.maxX, accuracy: 0.001, label)
+                XCTAssertEqual(fit.minY, screen.height - fit.maxY, accuracy: 0.001, label)
+            }
+        }
+    }
+
+    func testAspectFitBarsGoOnTheRightAxis() {
+        let view = CGSize(width: 1408, height: 970) // 1.45:1
+        // Wider stream (21:9) → letterbox (bars top/bottom).
+        let wide = ParsecResolution.aspectFit(CGSize(width: 3440, height: 1440), in: view)
+        XCTAssertEqual(wide.minX, 0, accuracy: 0.001)
+        XCTAssertGreaterThan(wide.minY, 0)
+        // Narrower stream (4:3, 5:4) → pillarbox (bars left/right).
+        for stream in [CGSize(width: 1024, height: 768), CGSize(width: 1280, height: 1024)] {
+            let fit = ParsecResolution.aspectFit(stream, in: view)
+            XCTAssertEqual(fit.minY, 0, accuracy: 0.001)
+            XCTAssertGreaterThan(fit.minX, 0)
+        }
+    }
+
+    func testAspectFitUnknownStreamOrEmptyViewUsesWholeBounds() {
+        let view = CGSize(width: 1408, height: 970)
+        // "Host Resolution" is 0x0 until the decoder reports a size.
+        XCTAssertEqual(ParsecResolution.host.width, 0)
+        XCTAssertEqual(ParsecResolution.aspectFit(.zero, in: view), CGRect(origin: .zero, size: view))
+        XCTAssertEqual(ParsecResolution.aspectFit(CGSize(width: 1920, height: 1080), in: .zero), .zero)
+    }
+
+    func testClientResolutionIsEvenAndIgnoresEmptyViews() {
+        let original = (ParsecResolution.client.width, ParsecResolution.client.height)
+        defer { ParsecResolution.updateClientResolution(width: original.0, height: original.1) }
+        // 1408 pt × 1.7196 = 2421 px: encoders need even sizes.
+        ParsecResolution.updateClientResolution(width: 2421, height: 1668)
+        XCTAssertEqual(ParsecResolution.client.width, 2420)
+        XCTAssertEqual(ParsecResolution.client.height, 1668)
+        // A not-yet-laid-out view (0x0) must not turn "Client" into "Host".
+        ParsecResolution.updateClientResolution(width: 0, height: 0)
+        XCTAssertEqual(ParsecResolution.client.width, 2420)
     }
 }

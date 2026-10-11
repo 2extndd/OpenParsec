@@ -139,7 +139,27 @@ enum ParsecResolution: String, CaseIterable, Hashable {
 	static var bitrates = [3, 5, 7, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 
 	static func updateClientResolution(width: Int, height: Int) {
-		clientSize = (width, height)
+		// Encoders need even dimensions (the view is 2421 px wide at 1.7196x).
+		guard width > 1, height > 1 else { return }
+		clientSize = (width & ~1, height & ~1)
+	}
+
+	/// Where a `stream`-sized frame lands when aspect-fit (letterbox/pillarbox,
+	/// centred, never stretched or cropped) into `bounds` — the same placement
+	/// ParsecClientGLRenderFrame uses for the dimensions given to
+	/// ParsecClientSetDimensions. Unknown stream size → the whole bounds.
+	static func aspectFit(_ stream: CGSize, in bounds: CGSize) -> CGRect {
+		guard stream.width > 0, stream.height > 0, bounds.width > 0, bounds.height > 0 else {
+			return CGRect(origin: .zero, size: bounds)
+		}
+		let scale = min(bounds.width / stream.width, bounds.height / stream.height)
+		let size = CGSize(width: stream.width * scale, height: stream.height * scale)
+		return CGRect(
+			x: (bounds.width - size.width) / 2,
+			y: (bounds.height - size.height) / 2,
+			width: size.width,
+			height: size.height
+		)
 	}
 }
 

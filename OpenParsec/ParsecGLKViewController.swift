@@ -129,8 +129,9 @@ class ParsecGLKViewController : ParsecPlayground {
 	}
 
 	func updateSize(width: CGFloat, height: CGFloat) {
-		glkView.frame.size.width = width
-		glkView.frame.size.height = height
+		// The GL surface always fills its parent (ParsecViewController.contentView)
+		// exactly, so drawable = view pixels and SDK dimensions = view points.
+		glkView.frame = CGRect(x: 0, y: 0, width: width, height: height)
 	}
 
 	

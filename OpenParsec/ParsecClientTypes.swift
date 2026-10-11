@@ -796,19 +796,21 @@ struct ParsecTransportRecoverySnapshot: Equatable, Sendable {
     }
 }
 
-/// Pure generation-aware policy for active-session transport loss. It owns no
-/// timers or SDK effects: callers execute the single reconnect or terminal
-/// effect through the existing lifecycle coordinator.
+/// DECODE_ERR_* (-10…-23). The SDK latches it in GetStatus until the next
+/// connect/disconnect (parsec.h), and nothing observable proves the decoder
+/// came back: the pre-render callback fires on every RenderFrame call, re-draws
+/// included (ParsecSDK 0x7ccf0). After iPadOS invalidates the VideoToolbox
+/// session in the background, vt_decode_frame returns -14 and the picture
+/// stays frozen, so a decode error is always a dead decoder.
 enum ParsecDecodeErrorPolicy {
-    static let maxFrameGap: Double = 3
-
-    /// A sticky decoder error with frames still arriving is not a dead session.
-    static func effectiveStatus(_ status: RemoteStatus, secondsSinceNewFrame: Double) -> RemoteStatus {
-        let isDecodeError = (-23 ... -10).contains(status.rawValue)
-        return isDecodeError && secondsSinceNewFrame < maxFrameGap ? .ok : status
+    static func isDecodeError(_ status: RemoteStatus) -> Bool {
+        (-23 ... -10).contains(status.rawValue)
     }
 }
 
+/// Pure generation-aware policy for active-session transport loss. It owns no
+/// timers or SDK effects: callers execute the single reconnect or terminal
+/// effect through the existing lifecycle coordinator.
 struct ParsecTransportRecoveryMonitor {
     let failureThreshold: Int
     private(set) var snapshot: ParsecTransportRecoverySnapshot
@@ -890,7 +892,10 @@ struct ParsecTransportRecoveryMonitor {
         }
 
         let failures = snapshot.consecutiveFailures + 1
-        guard failures >= failureThreshold else {
+        // A latched decode error never clears by itself: waiting out the
+        // streak only prolongs the frozen picture.
+        guard failures >= failureThreshold
+            || ParsecDecodeErrorPolicy.isDecodeError(status) else {
             snapshot = ParsecTransportRecoverySnapshot(
                 generation: generation,
                 phase: .monitoring,

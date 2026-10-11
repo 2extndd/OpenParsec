@@ -335,11 +335,15 @@ class ParsecSDKBridge: ParsecService
 			UInt32(height),
 			Float(scale)
 		)
-		Diagnostics.note(
-			"sdk-dimensions result=\(RemoteStatus(sdkStatus).rawValue) " +
-			"width=\(Int(width)) height=\(Int(height)) scale=\(scale)"
-		)
-		
+		// Successful calls are summarised once per settled change by
+		// ParsecViewController ("render-geometry event=settled").
+		if sdkStatus != PARSEC_OK {
+			Diagnostics.note(
+				"sdk-dimensions result=\(RemoteStatus(sdkStatus).rawValue) " +
+				"width=\(Int(width)) height=\(Int(height)) scale=\(scale)"
+			)
+		}
+
 		clientWidth = Float(width)
 		clientHeight = Float(height)
 		withMouseInfo {
@@ -353,11 +357,7 @@ class ParsecSDKBridge: ParsecService
 		let sdkStatus = ParsecClientGLRenderFrame(
 			_parsec,
 			UInt8(DEFAULT_STREAM),
-			{ _ in
-				// Fires only for a NEW host frame; must not call the SDK.
-				RenderClock.lastNewFrameAt = CACurrentMediaTime()
-				return true
-			},
+			nil, // pre-render fires on re-draws too: no new-frame signal (RenderClock)
 			nil,
 			timeout
 		)

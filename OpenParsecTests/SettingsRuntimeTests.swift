@@ -487,6 +487,40 @@ final class SettingsRuntimeTests: XCTestCase {
         XCTAssertFalse(C.shouldSendHostSwitch(language: "ru-RU", last: nil, sinceFocus: 2))
     }
 
+    // One physical action = one host toggle. Device log 11:37:42–48: ⌃⇧ tapped
+    // ~1/s alternated sent=true/false under the old 0.8 s window.
+    func testLanguageSwitchPairsOnlyMacroWithIPadChange() {
+        let same = ParsecViewController.isSameLanguageSwitchAction
+        XCTAssertFalse(same(false, 10, nil))
+        XCTAssertFalse(same(false, 10.2, (10, false)), "repeated ⌃⇧ is deliberate")
+        XCTAssertFalse(same(true, 10.2, (10, true)), "repeated Globe is deliberate")
+        XCTAssertTrue(same(true, 10.2, (10, false)), "iPad change right after ⌃⇧")
+        XCTAssertTrue(same(false, 10.2, (10, true)), "⌃⇧ right after iPad change")
+        XCTAssertFalse(same(true, 10.4, (10, false)), "separate Globe press")
+    }
+
+    func testRapidCtrlShiftAndPairedIPadChangeToggleOncePerPress() {
+        let controller = loadedController()
+        let macro = ["227:true", "44:true", "44:false", "227:false"]
+        let bare = ["224:true", "225:true", "225:false", "224:false"]
+        set(.ctrlShiftEmulatesCmdSpace, true)
+        set(.syncKeyboardLayout, true)
+        set(.layoutSyncHotkey, LayoutSyncHotkey.cmdSpace.rawValue)
+        ctrlShift(controller)
+        ctrlShift(controller)
+        XCTAssertEqual(service.keyboard, bare + macro + bare + macro)
+
+        // The iPad's own language change from that same press is not a 2nd toggle,
+        service.reset()
+        controller.startLanguageSyncIfNeeded()
+        defer { controller.stopLanguageSync() }
+        controller.languageSync?.onLanguageChange?("en-US")
+        XCTAssertEqual(service.keyboard, [])
+        // but the pair is consumed: the next Globe press switches again.
+        controller.languageSync?.onLanguageChange?("ru-RU")
+        XCTAssertEqual(service.keyboard, macro)
+    }
+
     func testFollowIPadLanguageSendsTheConfiguredHostChord() {
         let expected: [(LayoutSyncHotkey, [String])] = [
             (.cmdSpace, ["227:true", "44:true", "44:false", "227:false"]),

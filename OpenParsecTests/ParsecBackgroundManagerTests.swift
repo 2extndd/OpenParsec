@@ -116,6 +116,21 @@ final class ParsecBackgroundManagerTests: XCTestCase {
         XCTAssertEqual(harness.reconnects, ["peer-1"])
     }
 
+    func testDecoderRecoveryPreservesPresentationUntilReplacementStarts() {
+        let harness = makeHarness()
+        harness.manager.connectionDidStart(peerId: "peer-1", generation: 3)
+        harness.manager.preserveSessionPresentation(generation: 2)
+        XCTAssertFalse(harness.manager.shouldPreserveSessionPresentation)
+
+        harness.manager.preserveSessionPresentation(generation: 3)
+        harness.manager.connectionDidEnd(generation: 3, reason: .transportFailure)
+        XCTAssertTrue(harness.manager.shouldPreserveSessionPresentation)
+        XCTAssertTrue(harness.manager.isMarkedForReconnect)
+
+        harness.manager.connectionDidStart(peerId: "peer-1", generation: 4)
+        XCTAssertFalse(harness.manager.shouldPreserveSessionPresentation)
+    }
+
     func testDisableAutoReconnectCancelsScheduledActiveRecovery() {
         let harness = makeHarness()
         harness.manager.connectionDidStart(peerId: "peer-1", generation: 3)

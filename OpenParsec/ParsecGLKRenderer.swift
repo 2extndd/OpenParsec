@@ -2,36 +2,33 @@ import GLKit
 import UIKit
 
 // Freeze evidence for device logs. Distinguishes, per stall:
-//   frameAge  large, drawAge small → no new frames from host/network
+//   videoDead                      → SDK decoder failed (frozen picture)
 //   drawAge   large                → client render loop stopped
 //   pollGap   large                → client main thread hung
-// lastNewFrameAt is set from the SDK pre-render callback, which fires only
-// for NEW host frames (re-draws of the previous frame don't call it).
+// The SDK exposes no new-frame signal: its pre-render callback fires on every
+// RenderFrame call, re-draws of the previous frame included (ParsecSDK
+// 0x7ccf0), so it cannot tell a frozen picture from a live one.
 enum RenderClock {
 	static var lastDrawAt: CFTimeInterval = 0
-	static var lastNewFrameAt: CFTimeInterval = 0
 	private static var lastPollAt: CFTimeInterval = 0
 	private static var stalled = false
 
 	/// Main thread, from the 0.2 s session status poll.
-	static func check(paused: Bool, detail: @autoclosure () -> String) {
+	static func check(videoDead: Bool, paused: Bool, detail: @autoclosure () -> String) {
 		let now = CACurrentMediaTime()
 		// > 5 s means polling was suspended (background), not a hang.
 		let pollGap = (lastPollAt == 0 || now - lastPollAt > 5) ? 0 : now - lastPollAt
 		lastPollAt = now
-		guard lastNewFrameAt > 0 else { return }
-		let frameAge = now - lastNewFrameAt
+		guard lastDrawAt > 0 else { return }
 		let drawAge = now - lastDrawAt
-		// ponytail: 2 s for frames — a static host screen with Constant FPS off
-		// may legitimately send nothing; that shows up here as a host-side stall.
-		let stalledNow = frameAge > 2 || drawAge > 0.5 || pollGap > 0.5
+		let stalledNow = videoDead || drawAge > 0.5 || pollGap > 0.5
 		let ms = { (t: CFTimeInterval) in Int(t * 1000) }
 		if stalledNow && !stalled {
 			stalled = true
-			Diagnostics.note("render-stall frameAgeMs=\(ms(frameAge)) drawAgeMs=\(ms(drawAge)) pollGapMs=\(ms(pollGap)) paused=\(paused) \(detail())")
+			Diagnostics.note("render-stall videoDead=\(videoDead) drawAgeMs=\(ms(drawAge)) pollGapMs=\(ms(pollGap)) paused=\(paused) \(detail())")
 		} else if !stalledNow && stalled {
 			stalled = false
-			Diagnostics.note("render-resume frameAgeMs=\(ms(frameAge)) drawAgeMs=\(ms(drawAge))")
+			Diagnostics.note("render-resume drawAgeMs=\(ms(drawAge))")
 		}
 	}
 }
@@ -42,6 +39,7 @@ class ParsecGLKRenderer:NSObject, GLKViewDelegate, GLKViewControllerDelegate
 	var glkViewController:GLKViewController
 	
 	var lastSize = CGSize(width: 1.0, height: 1.0)
+	private var syncedGeneration: UInt64?
 	private var lastLoggedRenderGeneration: UInt64?
 
 	var lastImg: CGImage?
@@ -71,7 +69,14 @@ class ParsecGLKRenderer:NSObject, GLKViewDelegate, GLKViewControllerDelegate
 		let size = view.bounds.size
 		let widthChanged = abs(size.width - lastSize.width) > 0.1
 		let heightChanged = abs(size.height - lastSize.height) > 0.1
-		if widthChanged || heightChanged {
+		// Every connect (changeResolution's .reconfigure, reconnects) is a new
+		// SDK session that knows no window size: without this the first frames
+		// of the new stream drew stretched over the whole drawable (device log:
+		// viewport=0,0,2421,1668 for a 3024x1964 stream) until some unrelated
+		// resize happened.
+		let sessionGeneration = CParsec.sessionSnapshot.generation
+		if widthChanged || heightChanged || syncedGeneration != sessionGeneration {
+			syncedGeneration = sessionGeneration
 			synchronizeDimensions()
 		}
 
@@ -85,6 +90,9 @@ class ParsecGLKRenderer:NSObject, GLKViewDelegate, GLKViewControllerDelegate
 		let generation = CParsec.sessionSnapshot.generation
 		if result.producedFrame && lastLoggedRenderGeneration != generation {
 			lastLoggedRenderGeneration = generation
+			// SetDimensions while the session was still connecting may not
+			// stick; the session is certainly running once it produced a frame.
+			synchronizeDimensions()
 			Diagnostics.note(
 				"render-geometry event=first-produced generation=\(generation) " +
 				geometryDescription()
@@ -115,11 +123,8 @@ class ParsecGLKRenderer:NSObject, GLKViewDelegate, GLKViewControllerDelegate
 		guard size.width > 0, size.height > 0 else { return }
 		CParsec.setFrame(size.width, size.height, glkView.contentScaleFactor)
 		lastSize = size
-		Diagnostics.note(
-			"render-dimensions generation=\(CParsec.sessionSnapshot.generation) " +
-			"width=\(Int(size.width)) height=\(Int(size.height)) " +
-			"scale=\(glkView.contentScaleFactor) " + geometryDescription()
-		)
+		// No log here: this runs per frame during a resize animation. The
+		// settled result is logged once by ParsecViewController.
 	}
 
 	private func geometryDescription() -> String {

@@ -333,7 +333,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		scrollView.delegate = self
 		scrollView.minimumZoomScale = 1.0
 		scrollView.maximumZoomScale = 5.0
-		scrollView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+		// No autoresizing: layoutRenderSurface owns the frame.
 		scrollView.panGestureRecognizer.minimumNumberOfTouches = 2
         /*
          We set minimumNumberOfTouches to 2 for the scroll view's pan gesture
@@ -550,7 +550,8 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		replacement.viewDidLoad()
 		replacement.glkView.removeFromSuperview()
 		replacement.glkView.frame = contentView.bounds
-		contentView.addSubview(replacement.glkView)
+		// Below the cursor overlays (u, local dot), like the original surface.
+		contentView.insertSubview(replacement.glkView, at: 0)
 		replacement.updateSize(
 			width: contentView.bounds.width,
 			height: contentView.bounds.height
@@ -568,8 +569,78 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		(glkView as? ParsecGLKViewController)?.synchronizeDimensions()
 	}
 	
+	/// Single owner of the stream surface geometry (scrollView, contentView,
+	/// GL view). The surface is exactly the app window — never larger than the
+	/// screen, whatever frame SwiftUI hands this view (device log: 1408x991 on
+	/// a 970 pt screen → drawable 2421x1704, image cropped and shifted) and
+	/// independent of SwiftUI keyboard avoidance (the keyboard keeps working
+	/// through scrollView.contentInset: content shifts, never rescales). The SDK
+	/// then aspect-fits every stream size into it (ParsecClientGLRenderFrame,
+	/// see ParsecResolution.aspectFit), so no resolution is stretched or cut.
+	/// Before, contentView was resized only by rotation/foreground hooks that
+	/// read a mid-animation size and kept it for the rest of the session.
+	private func layoutRenderSurface(force: Bool = false) {
+		guard isViewLoaded, scrollView != nil, contentView != nil else { return }
+		var visible = view.bounds
+		if let window = view.window {
+			visible = view.convert(window.bounds, from: window)
+		}
+		visible = CGRect(
+			x: visible.minX.rounded(),
+			y: visible.minY.rounded(),
+			width: visible.width.rounded(.down),
+			height: visible.height.rounded(.down)
+		)
+		guard visible.width > 0, visible.height > 0 else { return }
+		let changed = scrollView.frame != visible || contentView.bounds.size != visible.size
+		if changed {
+			// contentView is the zoom view: its frame is only meaningful at 1x.
+			scrollView.setZoomScale(1.0, animated: false)
+			scrollView.frame = visible
+			contentView.frame = CGRect(origin: .zero, size: visible.size)
+			scrollView.contentSize = visible.size
+			glkView?.updateSize(width: visible.width, height: visible.height)
+			clampAndApplyLocalCursor()
+		}
+		guard changed || force else { return }
+		// Resize animations lay out every frame; tell the SDK and log once the
+		// size has held still. The renderer already follows size changes per
+		// frame, so this is the settled confirmation, not the only sync.
+		renderGeometrySettle?.cancel()
+		let work = DispatchWorkItem { [weak self] in self?.renderGeometryDidSettle() }
+		renderGeometrySettle = work
+		DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+	}
+
+	private var renderGeometrySettle: DispatchWorkItem?
+
+	private func renderGeometryDidSettle() {
+		guard UIApplication.shared.applicationState == .active else { return }
+		let size = contentView.bounds.size
+		guard size.width > 0, size.height > 0 else { return }
+		let scale = (glkView as? ParsecGLKViewController)?.glkView?.contentScaleFactor
+			?? view.contentScaleFactor
+		// "Client Resolution" = the pixels the stream is actually shown in.
+		ParsecResolution.updateClientResolution(
+			width: Int((size.width * scale).rounded()),
+			height: Int((size.height * scale).rounded())
+		)
+		synchronizeRenderDimensions()
+		let stream = CGSize(width: CGFloat(CParsec.hostWidth), height: CGFloat(CParsec.hostHeight))
+		let fit = ParsecResolution.aspectFit(stream, in: size)
+		let px = { (v: CGFloat) in Int((v * scale).rounded()) }
+		Diagnostics.note(
+			"render-geometry event=settled view=\(Int(size.width))x\(Int(size.height)) " +
+			"origin=\(Int(scrollView.frame.minX)),\(Int(scrollView.frame.minY)) " +
+			"scale=\(String(format: "%.4f", scale)) pixels=\(px(size.width))x\(px(size.height)) " +
+			"stream=\(Int(stream.width))x\(Int(stream.height)) " +
+			"fit=\(px(fit.minX)),\(px(fit.minY)),\(px(fit.width)),\(px(fit.height))"
+		)
+	}
+
 	override func viewDidLayoutSubviews() {
 		super.viewDidLayoutSubviews()
+		layoutRenderSurface()
 		// One-shot seed of the local cursor at the content view's centre
 		// after layout has produced real bounds. viewDidLoad reads zero
 		// bounds and would park the cursor at the corner.
@@ -587,18 +658,9 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		coordinator.animate(alongsideTransition: nil) { [weak self] _ in
 			guard let self,
 			      UIApplication.shared.applicationState == .active else { return }
-			let settledSize = self.view.bounds.size
-			guard settledSize.width > 0, settledSize.height > 0 else { return }
-
-			self.scrollView.zoomScale = 1.0
-			self.glkView.updateSize(
-				width: settledSize.width,
-				height: settledSize.height
-			)
-			self.contentView.frame.size = settledSize
-			self.scrollView.contentSize = settledSize
+			self.view.layoutIfNeeded()
+			self.layoutRenderSurface(force: true)
 			self.glkView.resume()
-			self.synchronizeRenderDimensions()
 
 			// Reset accessory view to ensure correct width in new orientation.
 			self.keyboardAccessoriesView = nil
@@ -656,6 +718,7 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		// Recover the render loop on any return to this screen (SwiftUI
 		// re-render, PiP exit, interrupted resolution change). Without this
 		// a left-over isPaused == true keeps the surface frozen/black.
+		layoutRenderSurface(force: true) // the window is attached only now
 		glkView?.resume()
 	}
 
@@ -683,14 +746,10 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 			}
 			self.setNeedsUpdateOfPrefersPointerLocked()
 			self.view.layoutIfNeeded()
-			let settledSize = self.contentView.bounds.size
-			guard settledSize.width > 0, settledSize.height > 0 else { return }
-			self.glkView.updateSize(
-				width: settledSize.width,
-				height: settledSize.height
-			)
+			// Recompute from the view, not the old contentView size: a size
+			// captured mid app-switch animation used to persist from here.
+			self.layoutRenderSurface(force: true)
 			self.glkView.resume()
-			self.synchronizeRenderDimensions()
 		}
 	}
 
@@ -916,9 +975,14 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 	}
 
 	private func clampAndApplyLocalCursor() {
-		let bounds = contentView.bounds
-		localCursorPosition.x = max(0, min(localCursorPosition.x, bounds.width))
-		localCursorPosition.y = max(0, min(localCursorPosition.y, bounds.height))
+		// Keep the local dot on the displayed image, not in the letterbox bars:
+		// the host cursor it stands for is confined to the host screen.
+		let bounds = ParsecResolution.aspectFit(
+			CGSize(width: CGFloat(CParsec.hostWidth), height: CGFloat(CParsec.hostHeight)),
+			in: contentView.bounds.size
+		)
+		localCursorPosition.x = max(bounds.minX, min(localCursorPosition.x, bounds.maxX))
+		localCursorPosition.y = max(bounds.minY, min(localCursorPosition.y, bounds.maxY))
 		localCursorImageView?.center = localCursorPosition
 	}
 
@@ -1133,23 +1197,34 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 		}
 	}
 
-	private var lastHostLanguageSwitchAt: CFTimeInterval = 0
+	private var lastHostLanguageSwitch: (at: CFTimeInterval, isSync: Bool)?
 
-	/// Every host input-source toggle goes through here: Globe sync, ⌃⇧ and `.
-	/// Two toggles within 0.8 s land back on the original layout ("switched
-	/// and immediately back"), e.g. a ⌃⇧ macro plus an iPad language change from
-	/// the same keypress, so the second one is dropped. Logged with its source.
+	/// Every host input-source toggle goes through here: Globe sync ("globe" =
+	/// iPad input-mode change), ⌃⇧ and `. One physical action = one host toggle:
+	/// a key macro and an iPad language change within 0.3 s of each other are
+	/// the same keypress seen twice, so the second is dropped and the pair is
+	/// consumed. Repeats of the same kind are deliberate and always sent (the
+	/// old 0.8 s window dropped every other ⌃⇧ press when tapped ~1/s).
 	func sendHostLanguageSwitch(source: String, send: () -> Void) {
 		let now = CACurrentMediaTime()
-		let duplicate = Self.isDuplicateLanguageSwitch(now: now, last: lastHostLanguageSwitchAt)
-		Diagnostics.note("layout-switch source=\(source) sent=\(!duplicate)")
+		let isSync = source == "globe"
+		let duplicate = Self.isSameLanguageSwitchAction(isSync: isSync, now: now, last: lastHostLanguageSwitch)
+		let sinceMs = lastHostLanguageSwitch.map { Int((now - $0.at) * 1000) } ?? -1
+		Diagnostics.note("layout-switch source=\(source) sent=\(!duplicate) sinceLastMs=\(sinceMs)")
+		lastHostLanguageSwitch = duplicate ? nil : (now, isSync)
 		guard !duplicate else { return }
-		lastHostLanguageSwitchAt = now
 		send()
 	}
 
-	static func isDuplicateLanguageSwitch(now: CFTimeInterval, last: CFTimeInterval) -> Bool {
-		last > 0 && now - last < 0.8
+	/// True when this toggle is the other half of the previous one: one is a
+	/// key macro, the other an iPad input-mode change, ≤ 0.3 s apart.
+	static func isSameLanguageSwitchAction(
+		isSync: Bool,
+		now: CFTimeInterval,
+		last: (at: CFTimeInterval, isSync: Bool)?
+	) -> Bool {
+		guard let last else { return false }
+		return last.isSync != isSync && now - last.at < 0.3
 	}
 	
 	@objc func keyboardWillShow(notification: NSNotification) {

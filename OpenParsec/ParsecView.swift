@@ -10,7 +10,6 @@ struct ParsecStatusBar : View {
 	@Binding var DCAlertText: String
 	@State var parsecViewController: ParsecViewController?
 	@State var wasDisconnected: Bool = true
-	@State private var decodeErrorTolerated = false
 	// Pure policy owns the failure streak and one-reconnect budget; the
 	// background manager remains the only scheduler/effect owner.
 	@State private var transportRecovery = ParsecTransportRecoveryMonitor(
@@ -148,20 +147,13 @@ struct ParsecStatusBar : View {
 		let generation = CParsec.sessionSnapshot.generation
 		let clientStatus = CParsec.getStatusEx(generation: generation)
 		guard CParsec.sessionSnapshot.generation == generation else { return }
-		// Decoder errors (-10…-23) are sticky in GetStatus until the next connect,
-		// but the SDK re-creates the hardware decoder itself: after even a 1 s
-		// app switch iPadOS reclaims it, GetStatus says -14 forever, and frames
-		// keep flowing. Treat that as healthy while new frames arrive; only a
-		// real gap (no new frame for 3 s) counts as a transport failure.
-		let status = ParsecDecodeErrorPolicy.effectiveStatus(
-			clientStatus.status,
-			secondsSinceNewFrame: CACurrentMediaTime() - RenderClock.lastNewFrameAt
-		)
-		if status != clientStatus.status, !decodeErrorTolerated {
-			decodeErrorTolerated = true
-			Diagnostics.note("decode-error-tolerated status=\(clientStatus.status.rawValue) generation=\(generation)")
-		}
+		// Decoder errors (-10…-23) mean the picture is frozen (typically iPadOS
+		// invalidated VideoToolbox while backgrounded); the transport monitor
+		// reconnects on the first such poll. See ParsecDecodeErrorPolicy.
+		let status = clientStatus.status
+		let decodeError = ParsecDecodeErrorPolicy.isDecodeError(status)
 		RenderClock.check(
+			videoDead: decodeError,
 			paused: (parsecViewController?.glkView as? ParsecGLKViewController)?.glkViewController.isPaused ?? false,
 			detail: "status=\(status.rawValue) queued=\(clientStatus.metrics.queuedFrames) decodeMs=\(String(format: "%.1f", clientStatus.metrics.decodeLatency)) encodeMs=\(String(format: "%.1f", clientStatus.metrics.encodeLatency)) netMs=\(String(format: "%.1f", clientStatus.metrics.networkLatency)) app=\(UIApplication.shared.applicationState.rawValue)"
 		)
@@ -203,6 +195,13 @@ struct ParsecStatusBar : View {
 			switch effect {
 			case let .reconnect(recoveryGeneration):
 				wasDisconnected = true
+				if decodeError {
+					// Same host, same output: keep the session view up while the
+					// replacement generation brings a fresh decoder.
+					ParsecBackgroundManager.shared.preserveSessionPresentation(
+						generation: recoveryGeneration
+					)
+				}
 				let disconnected = CParsec.disconnect(
 					reason: .transportFailure,
 					generation: recoveryGeneration
@@ -884,9 +883,10 @@ struct ParsecView: View
 			// new resolution; calling applyConfig() right after would issue a
 			// redundant ParsecClientSetConfig against a just-negotiated
 			// session (sometimes racy). Skip it.
-			if let parsecGLK = self.parsecViewController.glkView as? ParsecGLKViewController {
-				parsecGLK.glkViewController.isPaused = false
-			}
+			// The renderer pushes the view size to the new SDK session on its
+			// first draw of the new generation (ParsecGLKRenderer), so the new
+			// stream is aspect-fit instead of stretched over the drawable.
+			self.parsecViewController.glkView?.resume()
 
 			// If the reconnect didn't take (host offline, network blip),
 			// surface a real error instead of leaving the user staring at
@@ -962,26 +962,18 @@ struct ParsecView: View
 					.first(where: { $0.id == displayId })?.label ?? ""
 			}
 
-			// S10: switching the streamed monitor makes the host re-init its
-			// encoder for the new display (usually a different resolution),
-			// forcing a client-side decoder reset. During that window
-			// getStatusEx briefly returns non-OK, and the poll loop pops a
-			// spurious "Disconnected" alert — suppressed only while
-			// isReconfiguring. changeResolution raises that flag; changeDisplay
-			// historically never did (D1). Bracket the switch the same way.
-			self.isReconfiguring = true
+			// No isReconfiguring here: it put the "Switching resolution…" overlay
+			// over the stream and paused poll() for 1 s, which the render watchdog
+			// logged as a main-thread hang (render-stall pollGapMs≈1100 with
+			// drawAgeMs≈6). The host's encoder re-init is covered without it:
+			// decoder errors are tolerated while frames flow
+			// (ParsecDecodeErrorPolicy) and a disconnect needs 5 failed polls.
 			CParsec.updateHostVideoConfig()
 
-			// No reconnect happens here, so there's no completion callback to
-			// clear the flag — use a fixed window covering
-			// updateHostVideoConfig's 250/450 ms resend + echo cycle plus
-			// headroom. Resume the GL surface once it settles in case the
-			// decoder reset blanked it (D2 — same failure class as S01, on a
-			// path viewDidAppear/foreground hooks don't cover since no screen
-			// transition occurs here).
+			// Fallback repaint if the confirm (parsecDisplayOutputDidConfirm,
+			// which also resumes) never arrives; resume() is idempotent.
 			DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
 				self.parsecViewController.glkView?.resume()
-				self.isReconfiguring = false
 			}
 		}
 	}
