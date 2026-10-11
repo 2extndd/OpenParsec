@@ -131,7 +131,17 @@ final class OpenParsecUITests: XCTestCase {
         connectButton(in: app).tap()
         let pending = app.descendants(matching: .any)["openparsec.connection.pending"]
         XCTAssertTrue(pending.waitForExistence(timeout: 15))
-        app.buttons["Cancel"].tap()
+        // Tap only once the overlay's button is hittable: on slow CI runners a
+        // tap during the overlay's appear animation could miss.
+        let cancel = app.buttons["Cancel"]
+        XCTAssertEqual(
+            XCTWaiter.wait(
+                for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "isHittable == true"), object: cancel)],
+                timeout: 10
+            ),
+            .completed
+        )
+        cancel.tap()
 
         let hidden = NSPredicate(format: "exists == false")
         XCTAssertEqual(
