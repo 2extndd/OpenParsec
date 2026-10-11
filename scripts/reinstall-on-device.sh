@@ -48,7 +48,7 @@ if [[ $FORCE == 0 ]] && why=$(session_active); then say "skip: Parsec session in
 if [[ $FORCE == 0 ]] && ! git diff --quiet HEAD -- OpenParsec OpenParsec.xcodeproj 2>/dev/null; then
   say "skip: uncommitted changes in the app sources"; exit 0
 fi
-if ! xcrun devicectl list devices 2>/dev/null | grep -F "$DEVICE" | grep -q "available"; then
+if ! xcrun devicectl list devices 2>/dev/null | grep -F "$DEVICE" | grep -v unavailable | grep -qE "available|connected"; then
   say "skip: ${DEVICE} not reachable"; exit 0
 fi
 
