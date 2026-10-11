@@ -852,6 +852,35 @@ enum ParsecVideoSuspendPolicy {
         if elapsed >= nudgeAfter && !nudged { return .nudge }
         return .waiting
     }
+
+    /// Highest encoder bitrate (Mbps) the client will ever request from the host.
+    ///
+    /// The SDK's BUD frame reassembler `bud_write_packet` (ParsecSDK 0x722e4)
+    /// rebuilds each encoded frame by concatenating packet fragments into the
+    /// caller's decode buffer. It bounds-checks only the *declared* total frame
+    /// size against the buffer capacity (0x723c4; rejects with -0x2eeb), then
+    /// runs a copy loop (0x724cc–0x72518) that adds each per-packet length
+    /// (ldrsw [slot+0xbb8]) and decrements a byte counter w24, stopping only when
+    /// w24 hits exactly 0. No per-fragment length is re-validated against the
+    /// remaining count, so a lost / duplicated / ring-wrapped fragment whose
+    /// lengths don't sum to the declared total underflows w24 and the loop walks
+    /// past the buffer — SIGSEGV in the memcpy at 0x724f0 (crash return
+    /// ParsecSDK+468212 = 0x724f4, reached from decode_thread via
+    /// ParsecVersion+4284). A large frame is split into more fragments
+    /// (ceil((total+4)/[ctx+0x440])), so the loss/reorder that accompanies a
+    /// fresh session's congested ramp-up is far likelier to corrupt the
+    /// bookkeeping on a big H.265 keyframe for a 3024x1964 desktop.
+    ///
+    /// Field evidence (iPad Pro M4, LAN, macOS host, 3024x1964 H.265): SIGSEGV at
+    /// this exact site at 40 Mbps (Jul) and 50 Mbps, no crash at 20 Mbps — so 20
+    /// is the only empirically safe ceiling. `0` ("Host Default") is passed
+    /// through untouched: it sends no explicit request and has no crash data.
+    /// ponytail: conservative cap; values between 20 and 40 are simply untested.
+    static let maxSafeHostBitrate = 20
+
+    static func safeHostBitrate(_ requested: Int) -> Int {
+        requested > 0 ? min(requested, maxSafeHostBitrate) : requested
+    }
 }
 
 /// Pure generation-aware policy for active-session transport loss. It owns no

@@ -1060,7 +1060,11 @@ class ParsecSDKBridge: ParsecService
 		var videoConfig = ParsecUserDataVideoConfig()
 		videoConfig.video[0].resolutionX = DataManager.model.resolutionX
 		videoConfig.video[0].resolutionY = DataManager.model.resolutionY
-		videoConfig.video[0].encoderMaxBitrate = DataManager.model.bitrate
+		// Clamp at the one point bitrate reaches the host encoder: above
+		// maxSafeHostBitrate the host's large H.265 keyframes overflow the SDK's
+		// BUD reassembler and crash decode_thread (see ParsecVideoSuspendPolicy).
+		let safeBitrate = ParsecVideoSuspendPolicy.safeHostBitrate(DataManager.model.bitrate)
+		videoConfig.video[0].encoderMaxBitrate = safeBitrate
 		videoConfig.video[0].fullFPS = DataManager.model.constantFps
 		videoConfig.video[0].output = DataManager.model.output
 		let encoder = JSONEncoder()
@@ -1071,7 +1075,9 @@ class ParsecSDKBridge: ParsecService
 		// (rather than reverts) this selection.
 		configRevision &+= 1
 		let revision = configRevision
-		pendingUserConfig = (DataManager.model.bitrate, DataManager.model.constantFps)
+		// Record the clamped value so the host's echo (which reports the capped
+		// bitrate) confirms this push instead of being treated as a mismatch.
+		pendingUserConfig = (safeBitrate, DataManager.model.constantFps)
 		// Track a concrete display switch so the confirm-and-retry loop below can
 		// keep re-asserting it. "none" (Auto) has no stable echoed id to confirm
 		// against, so it just rides the base send + the existing 250 ms resend.

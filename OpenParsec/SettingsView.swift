@@ -103,9 +103,14 @@ struct SettingsView:View
 							}
 							CatItem("Max Bitrate")
 							{
+								// Values above maxSafeHostBitrate crash the SDK decoder on
+								// high-res H.265 keyframes (see ParsecVideoSuspendPolicy), so
+								// they are not offered; the send path clamps as a backstop.
 								MultiPicker(selection: $bitrate, options:
 								[Choice("Host Default", 0)]
-								+ ParsecResolution.bitrates.map { Choice("\($0) Mbps", $0) })
+								+ ParsecResolution.bitrates
+									.filter { $0 <= ParsecVideoSuspendPolicy.maxSafeHostBitrate }
+									.map { Choice("\($0) Mbps", $0) })
 							}
 							CatItem("Decoder")
 							{
@@ -377,6 +382,13 @@ struct SettingsView:View
 		}
 		.onChange(of: bitrate) { _ in
 			SettingsHandler.notifyChanged(.bitrate)
+		}
+		.onAppear {
+			// Pull a value saved before the safety cap down to the ceiling so the
+			// picker shows a selectable option and the host is never asked for more.
+			if bitrate > ParsecVideoSuspendPolicy.maxSafeHostBitrate {
+				bitrate = ParsecVideoSuspendPolicy.maxSafeHostBitrate
+			}
 		}
 	}
 	

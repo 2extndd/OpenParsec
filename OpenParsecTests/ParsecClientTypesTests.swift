@@ -1850,6 +1850,24 @@ final class ParsecClientTypesTests: XCTestCase {
         }
     }
 
+    // The bitrate sent to the host must never exceed the ceiling proven to
+    // survive the SDK's BUD reassembler (bud_write_packet) on big H.265
+    // keyframes: field crashes at 40/50 Mbps, none at 20.
+    func testHostBitrateIsClampedToTheSafeCeiling() {
+        typealias P = ParsecVideoSuspendPolicy
+        XCTAssertEqual(P.maxSafeHostBitrate, 20)
+        // Above the cap is pulled down.
+        XCTAssertEqual(P.safeHostBitrate(50), 20)
+        XCTAssertEqual(P.safeHostBitrate(40), 20)
+        XCTAssertEqual(P.safeHostBitrate(21), 20)
+        // At or below the cap is untouched.
+        XCTAssertEqual(P.safeHostBitrate(20), 20)
+        XCTAssertEqual(P.safeHostBitrate(10), 10)
+        // 0 ("Host Default") and any non-positive sentinel pass through unchanged.
+        XCTAssertEqual(P.safeHostBitrate(0), 0)
+        XCTAssertEqual(P.safeHostBitrate(-1), -1)
+    }
+
     func testVideoResumeRecoveryWaitsNudgesThenFallsBackToReconnect() {
         typealias P = ParsecVideoSuspendPolicy
         let ok = RemoteStatus.ok
