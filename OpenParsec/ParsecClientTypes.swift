@@ -879,8 +879,9 @@ enum ParsecVideoSuspendPolicy {
     /// this exact site at 40 Mbps (Jul) and 50 Mbps, no crash at 20 Mbps — so 20
     /// is the only empirically safe ceiling. `0` ("Host Default") adopts the
     /// host's own value from its first echo, so it is capped to 20 as well.
-    /// ponytail: conservative cap; values between 20 and 40 are simply untested.
-    static let maxSafeHostBitrate = 20
+    /// ponytail: raised to 30 at the user's request (2026-10-12): untested
+    /// between 20 and 40; drop back to 20 if the 0x724f4 crash reappears.
+    static let maxSafeHostBitrate = 30
 
     static func safeHostBitrate(_ requested: Int) -> Int {
         requested > 0 ? min(requested, maxSafeHostBitrate) : requested

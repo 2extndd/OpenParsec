@@ -1855,11 +1855,12 @@ final class ParsecClientTypesTests: XCTestCase {
     // keyframes: field crashes at 40/50 Mbps, none at 20.
     func testHostBitrateIsClampedToTheSafeCeiling() {
         typealias P = ParsecVideoSuspendPolicy
-        XCTAssertEqual(P.maxSafeHostBitrate, 20)
+        XCTAssertEqual(P.maxSafeHostBitrate, 30)
         // Above the cap is pulled down.
-        XCTAssertEqual(P.safeHostBitrate(50), 20)
-        XCTAssertEqual(P.safeHostBitrate(40), 20)
-        XCTAssertEqual(P.safeHostBitrate(21), 20)
+        XCTAssertEqual(P.safeHostBitrate(50), 30)
+        XCTAssertEqual(P.safeHostBitrate(40), 30)
+        XCTAssertEqual(P.safeHostBitrate(31), 30)
+        XCTAssertEqual(P.safeHostBitrate(30), 30)
         // At or below the cap is untouched.
         XCTAssertEqual(P.safeHostBitrate(20), 20)
         XCTAssertEqual(P.safeHostBitrate(10), 10)

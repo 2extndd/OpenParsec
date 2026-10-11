@@ -281,6 +281,9 @@ class ParsecSDKBridge: ParsecService
 		resetMediaReadiness()
 		videoResume = nil
 		stopBackgroundTaskAndWait()
+		// Flush queued key events (releases from releaseAll) before the SDK
+		// disconnect; a queued paste stops itself (generation changed).
+		virtualKeyQueue.sync {}
 		audioWanted = false
 		// setActive can block 10–100+ ms: off the main thread, on the same
 		// serial queue as activateAudio() so a quick reconnect's activation
@@ -960,15 +963,27 @@ class ParsecSDKBridge: ParsecService
 		)
 		keyboardMappingLock.unlock()
 
-		var keyboardMessagePress = ParsecMessage()
-		keyboardMessagePress.type = MESSAGE_KEYBOARD
-		keyboardMessagePress.keyboard.code = ParsecKeycode(mappedCode.rawValue)
-		keyboardMessagePress.keyboard.pressed = event.isPressBegin
-		let sent = sendGated(&keyboardMessagePress)
-		// A lost key-up is a stuck key on the host; make it visible in logs.
-		if sent != PARSEC_OK && !event.isPressBegin {
-			Diagnostics.note("input-release-failed status=\(sent.rawValue)")
+		// Every key event goes through the soft-keyboard tap queue: one order
+		// for hardware keys, taps and paced chords (keyboardGap).
+		virtualKeyQueue.async {
+			var keyboardMessagePress = ParsecMessage()
+			keyboardMessagePress.type = MESSAGE_KEYBOARD
+			keyboardMessagePress.keyboard.code = ParsecKeycode(mappedCode.rawValue)
+			keyboardMessagePress.keyboard.pressed = event.isPressBegin
+			let sent = self.sendGated(&keyboardMessagePress)
+			// A lost key-up is a stuck key on the host; make it visible in logs.
+			if sent != PARSEC_OK && !event.isPressBegin {
+				Diagnostics.note("input-release-failed status=\(sent.rawValue)")
+			}
 		}
+	}
+
+	/// Spaces out the events of a synthetic chord. Sent in the same instant,
+	/// macOS sometimes misses the input-source shortcut (⌘Space arriving as
+	/// Space with the ⌘ flag not yet applied), so Globe/⌃⇧ switched only
+	/// sometimes. Later key events queue behind the gap, keeping their order.
+	func keyboardGap(milliseconds: UInt32) {
+		virtualKeyQueue.async { usleep(milliseconds * 1000) }
 	}
 	
 	func sendGameControllerButtonMessage(controllerId: UInt32, _ button:RemoteGamepadButton, pressed: Bool)

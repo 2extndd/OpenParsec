@@ -171,7 +171,7 @@ enum ParsecResolution: String, CaseIterable, Hashable {
 	}
 
 	// Capped at ParsecVideoSuspendPolicy.maxSafeHostBitrate (SDK reassembly crash above it).
-	static var bitrates = [3, 5, 7, 10, 15, 20]
+	static var bitrates = [3, 5, 7, 10, 15, 20, 25, 30]
 
 	static func updateClientResolution(width: Int, height: Int) {
 		// Encoders need even dimensions (the view is 2421 px wide at 1.7196x).
@@ -286,11 +286,16 @@ protocol ParsecInputServicing {
 	func sendMouseDelta(_ dx: Int32, _ dy: Int32)
 	func sendMousePosition(_ x: Int32, _ y: Int32)
 	func sendKeyboardMessage(event: KeyBoardKeyEvent)
+	func keyboardGap(milliseconds: UInt32)
 	func sendVirtualKeyboardInput(text: String)
 	func sendGameControllerButtonMessage(controllerId: UInt32, _ button: RemoteGamepadButton, pressed: Bool)
 	func sendGameControllerAxisMessage(controllerId: UInt32, _ axis: RemoteGamepadAxis, _ value: Int16)
 	func sendGameControllerUnplugMessage(controllerId: UInt32)
 	func sendWheelMsg(x: Int32, y: Int32)
+}
+
+extension ParsecInputServicing {
+	func keyboardGap(milliseconds: UInt32) {}
 }
 
 protocol ParsecService: ParsecSessionServicing, ParsecRenderingServicing, ParsecInputServicing {
@@ -979,6 +984,7 @@ class CParsec
 				}
 				continue
 			}
+			if !pressedForChord.isEmpty { parsecImpl.keyboardGap(milliseconds: 20) }
 			_ = keyboardStateMachine.press(key)
 			pressedForChord.append(key)
 			parsecImpl.sendKeyboardMessage(
@@ -989,7 +995,10 @@ class CParsec
 				)
 			)
 		}
-		for key in pressedForChord.reversed() {
+		// Hold the chord briefly, then release one key at a time (see keyboardGap).
+		parsecImpl.keyboardGap(milliseconds: 40)
+		for (i, key) in pressedForChord.reversed().enumerated() {
+			if i > 0 { parsecImpl.keyboardGap(milliseconds: 20) }
 			_ = keyboardStateMachine.release(key)
 			parsecImpl.sendKeyboardMessage(
 				event: KeyBoardKeyEvent(
