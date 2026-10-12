@@ -507,7 +507,7 @@ final class ParsecClientTypesTests: XCTestCase {
     )
 
     func testCanonicalSettingsRegistryOwnsKeysAndDefaults() {
-        XCTAssertEqual(ParsecSettingID.allCases.count, 30)
+        XCTAssertEqual(ParsecSettingID.allCases.count, 31)
         XCTAssertEqual(
             Set(ParsecSettingsContract.descriptors.map(\.id)),
             Set(ParsecSettingID.allCases)
@@ -621,7 +621,7 @@ final class ParsecClientTypesTests: XCTestCase {
             ParsecSettingsContract.descriptors.count,
             "Duplicate contract entries for a key"
         )
-        XCTAssertEqual(ParsecSettingsContract.coverageCount, 30)
+        XCTAssertEqual(ParsecSettingsContract.coverageCount, 31)
     }
 
     func testSettingsContractClassificationsAreInternallyConsistent() {
@@ -2718,5 +2718,53 @@ final class ParsecConnectionTestTests: XCTestCase {
         // A not-yet-laid-out view (0x0) must not turn "Client" into "Host".
         ParsecResolution.updateClientResolution(width: 0, height: 0)
         XCTAssertEqual(ParsecResolution.client.width, 2420)
+    }
+}
+
+// Mac stream size (mac-helper/ParsecLowDisplay)
+final class MacLowDisplayTests: XCTestCase {
+    func testMacStreamScaleMatchesTheHelper() {
+        // Same numbers as ParsecLowDisplay --self-test (PLScaled).
+        XCTAssertTrue(MacStreamScale.half.size(native: (3024, 1964)) == (1512, 982))
+        XCTAssertTrue(MacStreamScale.half.size(native: (3840, 1608)) == (1920, 804))
+        XCTAssertTrue(MacStreamScale.twoThirds.size(native: (3024, 1964)) == (2016, 1310))
+        XCTAssertTrue(MacStreamScale.twoThirds.size(native: (3840, 1608)) == (2560, 1072))
+        XCTAssertTrue(MacStreamScale.native.size(native: (3024, 1964)) == (3024, 1964))
+        let odd = MacStreamScale.half.size(native: (1919, 1079))
+        XCTAssertTrue(odd.width % 2 == 0 && odd.height % 2 == 0)
+        // Raw values are the helper's levels; keys are Ctrl+Opt+Cmd + H/J/K/L (HID).
+        XCTAssertEqual(MacStreamScale.allCases.map(\.rawValue), [0, 3, 2])
+        XCTAssertEqual(MacStreamScale.allCases.map(\.key.rawValue), [11, 14, 13])
+        XCTAssertEqual(MacStreamScale.nextDisplayKey.rawValue, 15)
+        XCTAssertEqual(MacStreamScale.modifiers.map(\.rawValue), [224, 226, 227])
+        XCTAssertEqual(MacStreamScale.half.label(native: (3024, 1964)), "½ 1512×982 · Retina 1×, same layout")
+        XCTAssertEqual(MacStreamScale.native.label(native: nil), "Mac native")
+    }
+
+    func testMacLowDisplayPolicy() {
+        let d1 = ParsecDisplayConfig(name: "Built-in Retina Display", adapterName: "", id: "1")
+        let d3 = ParsecDisplayConfig(name: "LG", adapterName: "", id: "3")
+        let low = ParsecDisplayConfig(name: "Parsec Low", adapterName: "", id: "9")
+        typealias P = MacLowDisplayPolicy
+        XCTAssertEqual(P.virtual(in: [d1, low])?.id, "9")
+        XCTAssertNil(P.virtual(in: [d1, d3]))
+
+        XCTAssertEqual(P.mirroredSource(native: [d1, d3], current: [low, d3]), "1")
+        XCTAssertEqual(P.mirroredSource(native: [d1, d3], current: [d1, low]), "3")
+        XCTAssertNil(P.mirroredSource(native: [d1, d3], current: [low]), "ambiguous")
+        XCTAssertNil(P.mirroredSource(native: [], current: [low, d3]))
+
+        // On: ask until it exists, then stream it (whatever was streaming).
+        XCTAssertEqual(P.reconcile(configs: [d1, d3], output: "1", scale: .half, source: nil), .sendScale)
+        XCTAssertEqual(P.reconcile(configs: [low, d3], output: "1", scale: .half, source: nil), .stream("9"))
+        XCTAssertEqual(P.reconcile(configs: [low, d3], output: "none", scale: .twoThirds, source: nil), .stream("9"))
+        XCTAssertEqual(P.reconcile(configs: [low, d3], output: "9", scale: .half, source: "1"), .none)
+        // Off: remove a leftover, then go back to the mirrored display.
+        XCTAssertEqual(P.reconcile(configs: [low, d3], output: "9", scale: .native, source: "1"), .sendScale)
+        XCTAssertEqual(P.reconcile(configs: [d1, d3], output: "9", scale: .native, source: "1"), .stream("1"))
+        XCTAssertEqual(P.reconcile(configs: [d1, d3], output: "none", scale: .native, source: "1"), .stream("1"))
+        XCTAssertEqual(P.reconcile(configs: [d1, d3], output: "3", scale: .native, source: "1"), .none, "user's own choice")
+        XCTAssertEqual(P.reconcile(configs: [d1, d3], output: "none", scale: .native, source: nil), .none)
+        XCTAssertEqual(P.reconcile(configs: [d3], output: "none", scale: .native, source: "1"), .none, "source unplugged")
     }
 }

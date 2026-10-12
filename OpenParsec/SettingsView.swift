@@ -30,6 +30,7 @@ struct SettingsView:View
 	@AppStorage(ParsecSettingID.backtickEmulatesCmdSpace.rawValue) var backtickEmulatesCmdSpace: Bool = SettingsDefaults.backtickEmulatesCmdSpace
 	@AppStorage(ParsecSettingID.saveSessionSettings.rawValue) var saveSessionSettings: Bool = SettingsDefaults.saveSessionSettings
 	@AppStorage(ParsecSettingID.bitrate.rawValue) var bitrate: Int = SettingsDefaults.bitrate
+	@AppStorage(ParsecSettingID.macStreamScale.rawValue) var macStreamScale: MacStreamScale = SettingsDefaults.macStreamScale
 	@State private var crashCopied: Bool = false
 	@State private var diagCopied: Bool = false
 	@State private var keyProbeStarted: Bool = false
@@ -100,6 +101,11 @@ struct SettingsView:View
 							CatItem("Resolution")
 							{
 								MultiPicker(selection: $resolution, options:resolutionChoices)
+							}
+							CatItem("Mac Stream Size (Mac helper)")
+							{
+								MultiPicker(selection: $macStreamScale, options:
+									MacStreamScale.allCases.map { Choice($0.label(native: nil), $0) })
 							}
 							CatItem("Max Bitrate")
 							{

@@ -208,7 +208,73 @@ final class SettingsRuntimeTests: XCTestCase {
         XCTAssertFalse(SettingsHandler.decoderCompatibility)
         XCTAssertFalse(SettingsHandler.savedConstantFps)
         XCTAssertFalse(DataManager.model.constantFps)
+        XCTAssertEqual(SettingsHandler.macStreamScale, .half)
         _ = controller
+    }
+
+    // MARK: - Mac stream size (mac-helper/ParsecLowDisplay)
+
+    private let mac1 = ParsecDisplayConfig(name: "Built-in Retina Display", adapterName: "", id: "1")
+    private let mac3 = ParsecDisplayConfig(name: "LG ULTRAGEAR", adapterName: "", id: "3")
+    private let low = ParsecDisplayConfig(name: "Parsec Low", adapterName: "", id: "16")
+
+    private func resetMacLow(output: String, hostOS: Int = 2) {
+        service.hostOSValue = hostOS
+        CParsec.macLowSource = nil
+        CParsec.lastMacLowKeyAt = .distantPast
+        DataManager.model.output = output
+        service.reset()
+    }
+
+    func testChoosingMacStreamScaleSendsTheHelperHotkey() {
+        resetMacLow(output: "1")
+        CParsec.setMacStreamScale(.half)
+        XCTAssertEqual(SettingsHandler.macStreamScale, .half)
+        // Ctrl+Opt+Cmd+J, released in reverse.
+        XCTAssertEqual(service.keyboard, ["224:true", "226:true", "227:true", "13:true", "13:false", "227:false", "226:false", "224:false"])
+        service.reset()
+        CParsec.setMacStreamScale(.native)
+        XCTAssertEqual(service.keyboard.filter { $0.hasSuffix(":true") }, ["224:true", "226:true", "227:true", "11:true"])
+    }
+
+    func testMacLowDisplayFullCycleOnAMacHost() {
+        resetMacLow(output: "1")
+        SettingsHandler.macStreamScale = .half
+
+        // Connect: no virtual display yet → ask the helper for one, once.
+        CParsec.reconcileMacLowDisplay([mac1, mac3])
+        XCTAssertEqual(service.keyboard.filter { $0.hasSuffix(":true") }, ["224:true", "226:true", "227:true", "13:true"])
+        service.reset()
+        CParsec.reconcileMacLowDisplay([mac1, mac3])
+        XCTAssertEqual(service.keyboard, [], "rate-limited: no helper, no hotkey storm")
+
+        // The helper mirrored display 1 into "Parsec Low": stream it.
+        CParsec.reconcileMacLowDisplay([low, mac3])
+        XCTAssertEqual(DataManager.model.output, "16")
+        XCTAssertEqual(service.videoConfigPushes, 1)
+        XCTAssertEqual(CParsec.macLowSource, "1")
+        CParsec.reconcileMacLowDisplay([low, mac3])
+        XCTAssertEqual(service.videoConfigPushes, 1, "already streaming it")
+
+        // "Switch Display" moved the mirror to display 3.
+        CParsec.reconcileMacLowDisplay([mac1, low])
+        XCTAssertEqual(CParsec.macLowSource, "3")
+
+        // Native: the helper removed it → back to the display it mirrored.
+        SettingsHandler.macStreamScale = .native
+        DataManager.model.output = "none" // case 12's stale-reset of the vanished id
+        CParsec.reconcileMacLowDisplay([mac1, mac3])
+        XCTAssertEqual(DataManager.model.output, "3")
+        XCTAssertNotEqual(SettingsHandler.savedDisplayOutput, "16", "the virtual display is never remembered")
+    }
+
+    func testMacLowDisplayIsIgnoredOnOtherHosts() {
+        resetMacLow(output: "1", hostOS: 0) // Windows
+        SettingsHandler.macStreamScale = .half
+        CParsec.reconcileMacLowDisplay([mac1, low])
+        XCTAssertEqual(service.keyboard, [])
+        XCTAssertEqual(DataManager.model.output, "1")
+        XCTAssertEqual(service.videoConfigPushes, 0)
     }
 
     // MARK: Pointer & Trackpad

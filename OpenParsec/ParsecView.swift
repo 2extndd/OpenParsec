@@ -419,21 +419,16 @@ struct ParsecView: View
 									.multilineTextAlignment(.center)
 							}
 							Menu() {
-								ForEach(resolutions, id: \.self) { resolution in
-									// The selection, not the stream size: a Mac host always
-									// echoes its native size, which matches no menu entry.
-									let isCurrent = resolution == SettingsHandler.resolution
-									Button(action: {
-										changeResolution(res: resolution)
-									}) {
+								ForEach(resolutionMenuRows, id: \.label) { row in
+									Button(action: row.choose) {
 										// iOS 14.0–14.4's UIMenu bridge crashes when SwiftUI lowers a
 										// `if Label else Text` body inside a Menu's Button to
-										// `_ConditionalContent<Label, Text>`. A single homogeneous
-										// HStack with a conditional Image is safe and renders the
-										// same checkmark visual.
+										// `_ConditionalContent<Label, Text>` (so: one ForEach, no
+										// if/else in the Menu). A single homogeneous HStack with a
+										// conditional Image is safe and renders the same checkmark.
 										HStack {
-											Text(resolution.desc)
-											if isCurrent {
+											Text(row.label)
+											if row.isCurrent {
 												Spacer(minLength: 8)
 												Image(systemName: "checkmark")
 											}
@@ -470,7 +465,17 @@ struct ParsecView: View
 									.multilineTextAlignment(.center)
 							}
 							// Auto ("none"): the host's echoed output is what is streaming.
-							if let target = ParsecDisplayConfig.toggleTarget(in: dataModel.displayConfigs, current: dataModel.output == "none" ? dataModel.hostOutput : dataModel.output) {
+							if MacLowDisplayPolicy.virtual(in: dataModel.displayConfigs) != nil {
+								// The virtual display mirrors one monitor: the helper
+								// moves it to the next one, the stream stays on it.
+								Button(action: { CParsec.sendMacLowDisplayKey(MacStreamScale.nextDisplayKey) }) {
+									Text("Switch Display")
+										.padding(.vertical, 7)
+										.padding(.horizontal, 8)
+										.frame(maxWidth:.infinity)
+										.multilineTextAlignment(.center)
+								}
+							} else if let target = ParsecDisplayConfig.toggleTarget(in: dataModel.displayConfigs, current: dataModel.output == "none" ? dataModel.hostOutput : dataModel.output) {
 								// Two monitors: one tap flips to the other one.
 								Button(action: { changeDisplay(displayId: target.id) }) {
 									Text("Switch to \(target.menuLabel(in: dataModel.displayConfigs))")
@@ -911,6 +916,20 @@ struct ParsecView: View
 			DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
 				self.isReconfiguring = false
 			}
+		}
+	}
+
+	// A Mac host streams native unless the Mac helper's virtual display stands
+	// in, so it gets that display's sizes. Otherwise the selection, not the
+	// stream size, is checked.
+	var resolutionMenuRows: [(label: String, isCurrent: Bool, choose: () -> Void)] {
+		guard CParsec.hostOS == .macos else {
+			return resolutions.map { res in (res.desc, res == SettingsHandler.resolution, { changeResolution(res: res) }) }
+		}
+		let native = MacLowDisplayPolicy.virtual(in: dataModel.displayConfigs) == nil
+			? CParsec.parsecImpl.flatMap { $0.hostWidth > 0 ? (width: Int($0.hostWidth), height: Int($0.hostHeight)) : nil } : nil
+		return MacStreamScale.allCases.map { scale in
+			(scale.label(native: native), scale == SettingsHandler.macStreamScale, { CParsec.setMacStreamScale(scale) })
 		}
 	}
 

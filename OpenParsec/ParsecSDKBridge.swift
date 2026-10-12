@@ -253,6 +253,13 @@ class ParsecSDKBridge: ParsecService
 				DataManager.model.output = "none"
 				DataManager.model.hostOutput = "none"
 				DataManager.model.displayConfigs = []
+				CParsec.macLowSource = nil
+			}
+		}
+		// The helper's virtual display lives for one session: don't push its id.
+		DispatchQueue.main.async {
+			if let low = MacLowDisplayPolicy.virtual(in: DataManager.model.displayConfigs), DataManager.model.output == low.id {
+				DataManager.model.output = CParsec.macLowSource ?? "none"
 			}
 		}
 
@@ -561,6 +568,11 @@ class ParsecSDKBridge: ParsecService
 							DataManager.model.output = videoConfig.output
 						}
 						self.updateHostVideoConfig()
+						// Mac stream size: the display list may have arrived
+						// before hostOS was known.
+						if CParsec.hostOS == .macos, SettingsHandler.macStreamScale != .native {
+							CParsec.sendUserData(type: .getAdapterInfo, message: Data())
+						}
 					}
 				}
 				
@@ -583,6 +595,7 @@ class ParsecSDKBridge: ParsecService
 						self.pendingOutput = nil // stop re-asserting the missing id
 						Diagnostics.note("display-output event=stale-reset")
 					}
+					CParsec.reconcileMacLowDisplay(config)
 					// Restore the saved display ONCE per session. The host
 					// can re-advertise its display list multiple times mid-
 					// stream (sleep/wake, display hot-plug); without this

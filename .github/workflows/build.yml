@@ -58,6 +58,8 @@ jobs:
           bash scripts/test.sh
       - name: Audio ring check
         run: xcrun clang -framework AudioToolbox scripts/audio-ring-check.c -o /tmp/audio-ring-check && /tmp/audio-ring-check
+      - name: Mac helper self-test
+        run: xcrun clang -fobjc-arc -framework Cocoa -framework Carbon mac-helper/ParsecLowDisplay.m -o /tmp/parsec-low-display && /tmp/parsec-low-display --self-test
       - name: Archive
         env:
           scheme: ${{ steps.scheme.outputs.scheme }}

@@ -1061,6 +1061,60 @@ class CParsec
 		)
 	}
 	
+	// Mac stream size (MacLowDisplayPolicy). The last host display list without
+	// the virtual display, the physical display it mirrors, the last hotkey.
+	private static var macNativeDisplays: [ParsecDisplayConfig] = []
+	static var macLowSource: String?
+	static var lastMacLowKeyAt = Date.distantPast
+
+	// A ParsecLowDisplay hotkey. The host re-lists its displays once the helper
+	// has reconfigured them (~2 s + RTT); ask again in case it doesn't push.
+	static func sendMacLowDisplayKey(_ key: RemoteKeyCode) {
+		lastMacLowKeyAt = Date()
+		sendKeyboardChord(MacStreamScale.modifiers + [key], route: .explicitMacro)
+		let session = parsecImpl as AnyObject
+		for delay in [3.0, 6.0] {
+			DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+				// Only into the same service: never a destroyed or swapped one.
+				guard let impl = parsecImpl, impl as AnyObject === session else { return }
+				impl.sendUserData(type: .getAdapterInfo, message: Data())
+			}
+		}
+	}
+
+	static func setMacStreamScale(_ scale: MacStreamScale) {
+		SettingsHandler.macStreamScale = scale
+		Diagnostics.note("mac-low event=choose scale=\(scale)")
+		sendMacLowDisplayKey(scale.key)
+	}
+
+	// Steer the session onto / off the virtual display on every host display
+	// list (main thread).
+	static func reconcileMacLowDisplay(_ configs: [ParsecDisplayConfig]) {
+		guard hostOS == .macos else { return }
+		if MacLowDisplayPolicy.virtual(in: configs) == nil {
+			macNativeDisplays = configs
+		} else if let source = MacLowDisplayPolicy.mirroredSource(native: macNativeDisplays, current: configs) {
+			macLowSource = source
+		}
+		let scale = SettingsHandler.macStreamScale
+		switch MacLowDisplayPolicy.reconcile(configs: configs, output: DataManager.model.output, scale: scale, source: macLowSource) {
+		case .none:
+			break
+		case .stream(let id):
+			// Not persisted as the saved display: the virtual one is per session.
+			Diagnostics.note("mac-low event=stream output=\(id)")
+			DataManager.model.output = id
+			updateHostVideoConfig()
+		case .sendScale:
+			// Without the helper on the Mac nothing changes: don't repeat it on
+			// every list.
+			guard Date().timeIntervalSince(lastMacLowKeyAt) > 10 else { return }
+			Diagnostics.note("mac-low event=request scale=\(scale)")
+			sendMacLowDisplayKey(scale.key)
+		}
+	}
+
 	static func sendVirtualKeyboardInput(text: String) {
 		guard !text.isEmpty else { return }
 		if KeyCodeTranslators.parsecKeyCodeTranslator(text) != nil || text.count == 1 {

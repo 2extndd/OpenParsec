@@ -56,6 +56,7 @@ struct SettingsHandler {
 	//public static var renderer:RendererType = .opengl
 	@SettingStorage(.resolution) static var resolution: ParsecResolution = SettingsDefaults.resolution
 	@SettingStorage(.bitrate) static var bitrate: Int = SettingsDefaults.bitrate
+	@SettingStorage(.macStreamScale) static var macStreamScale: MacStreamScale = SettingsDefaults.macStreamScale
 	@SettingStorage(.decoder) static var decoder: DecoderPref = SettingsDefaults.decoder
 	@SettingStorage(.cursorMode) static var cursorMode: CursorMode = SettingsDefaults.cursorMode
 	@SettingStorage(.pointerPresentationMode) static var pointerPresentationMode: PointerPresentationMode = SettingsDefaults.pointerPresentationMode
@@ -238,6 +239,8 @@ struct SettingsHandler {
 		// a static desktop costs almost nothing. Live session too (next push).
 		savedConstantFps = false
 		DataManager.model.constantFps = false
+		// A Mac host ignores `resolution`; ½ is its Retina 1× (same layout).
+		macStreamScale = .half
 		Diagnostics.note(
 			"setting-preset id=poor-network result=applied reconnect=resolution,decoder,compatibility"
 		)

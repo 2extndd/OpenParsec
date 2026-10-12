@@ -5,6 +5,7 @@ import Foundation
 enum ParsecSettingID: String, CaseIterable {
     case resolution
     case bitrate
+    case macStreamScale
     case decoder
     case cursorMode
     case pointerPresentationMode
@@ -39,6 +40,7 @@ enum ParsecSettingID: String, CaseIterable {
 enum SettingsDefaults {
     static let resolution: ParsecResolution = .client
     static let bitrate = 0
+    static let macStreamScale: MacStreamScale = .native
     static let decoder: DecoderPref = .h264
     static let cursorMode: CursorMode = .touchpad
     static let pointerPresentationMode: PointerPresentationMode = .native
@@ -72,6 +74,7 @@ enum SettingsDefaults {
         switch id {
         case .resolution: ParsecSettingDefault(resolution)
         case .bitrate: ParsecSettingDefault(bitrate)
+        case .macStreamScale: ParsecSettingDefault(macStreamScale)
         case .decoder: ParsecSettingDefault(decoder)
         case .cursorMode: ParsecSettingDefault(cursorMode)
         case .pointerPresentationMode: ParsecSettingDefault(pointerPresentationMode)
@@ -193,6 +196,15 @@ enum ParsecSettingsContract {
             host: .any,
             application: .reconnect,
             invalidCombinationNote: ""
+        ),
+        ParsecSettingDescriptor(
+            id: .macStreamScale,
+            kind: .userVisibleControl,
+            hasUIControl: true,
+            consumer: "Mac host stream size via mac-helper/ParsecLowDisplay (virtual display the streamed display mirrors).",
+            host: .macOS,
+            application: .live,
+            invalidCombinationNote: "Needs the Mac helper; without it the hotkey is ignored and the host keeps streaming native."
         ),
         ParsecSettingDescriptor(
             id: .bitrate,
