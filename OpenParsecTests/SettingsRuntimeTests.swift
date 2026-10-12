@@ -206,6 +206,8 @@ final class SettingsRuntimeTests: XCTestCase {
         XCTAssertEqual(SettingsHandler.resolution.height, 720)
         XCTAssertTrue(SettingsHandler.decoder == .h265)
         XCTAssertFalse(SettingsHandler.decoderCompatibility)
+        XCTAssertFalse(SettingsHandler.savedConstantFps)
+        XCTAssertFalse(DataManager.model.constantFps)
         _ = controller
     }
 

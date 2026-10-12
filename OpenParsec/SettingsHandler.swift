@@ -234,6 +234,10 @@ struct SettingsHandler {
 		// Bitrate and Resolution from the session with no way back.
 		decoderCompatibility = false     // compat decode path adds latency
 		bitrate = 5                      // poor-network ceiling (Mbps)
+		// Constant FPS makes the host send 60 fps of an unchanged screen; off,
+		// a static desktop costs almost nothing. Live session too (next push).
+		savedConstantFps = false
+		DataManager.model.constantFps = false
 		Diagnostics.note(
 			"setting-preset id=poor-network result=applied reconnect=resolution,decoder,compatibility"
 		)
