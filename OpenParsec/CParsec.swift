@@ -1083,9 +1083,9 @@ class CParsec
 	}
 
 	static func setMacStreamScale(_ scale: MacStreamScale) {
-		SettingsHandler.macStreamScale = scale
 		Diagnostics.note("mac-low event=choose scale=\(scale)")
-		sendMacLowDisplayKey(scale.key)
+		sendMacLowDisplayKey(scale.key) // first: the live settings handler then skips it
+		SettingsHandler.macStreamScale = scale
 	}
 
 	// Steer the session onto / off the virtual display on every host display

@@ -801,6 +801,11 @@ class ParsecViewController: UIViewController, UIScrollViewDelegate {
 				  DataManager.model.bitrate != SettingsHandler.bitrate else { return }
 			DataManager.model.bitrate = SettingsHandler.bitrate
 			CParsec.updateHostVideoConfig()
+		case .macStreamScale:
+			// Settings / poor-network preset; the session menu sends it itself.
+			guard CParsec.hostOS == .macos,
+				  Date().timeIntervalSince(CParsec.lastMacLowKeyAt) > 1 else { return }
+			CParsec.sendMacLowDisplayKey(SettingsHandler.macStreamScale.key)
 		default:
 			return
 		}
