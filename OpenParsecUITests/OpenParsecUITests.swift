@@ -425,7 +425,7 @@ final class OpenParsecUITests: XCTestCase {
         // content-free settings diagnostics surface.
         assertElement(
             "openparsec.settings.diagnostics",
-            hasLabel: "count=30 visible=25 toolbar=windows",
+            hasLabel: "count=31 visible=26 toolbar=windows",
             in: app,
             timeout: 10
         )
