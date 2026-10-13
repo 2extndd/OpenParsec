@@ -465,7 +465,7 @@ struct ParsecView: View
 									.multilineTextAlignment(.center)
 							}
 							// Auto ("none"): the host's echoed output is what is streaming.
-							if MacLowDisplayPolicy.virtual(in: dataModel.displayConfigs) != nil {
+							if MacLowDisplayPolicy.virtual(in: dataModel.displayConfigs, native: CParsec.macNativeDisplays) != nil {
 								// The virtual display mirrors one monitor: the helper
 								// moves it to the next one, the stream stays on it.
 								Button(action: { CParsec.sendMacLowDisplayKey(MacStreamScale.nextDisplayKey) }) {
@@ -926,7 +926,7 @@ struct ParsecView: View
 		guard CParsec.hostOS == .macos else {
 			return resolutions.map { res in (res.desc, res == SettingsHandler.resolution, { changeResolution(res: res) }) }
 		}
-		let native = MacLowDisplayPolicy.virtual(in: dataModel.displayConfigs) == nil
+		let native = MacLowDisplayPolicy.virtual(in: dataModel.displayConfigs, native: CParsec.macNativeDisplays) == nil
 			? CParsec.parsecImpl.flatMap { $0.hostWidth > 0 ? (width: Int($0.hostWidth), height: Int($0.hostHeight)) : nil } : nil
 		return MacStreamScale.allCases.map { scale in
 			(scale.label(native: native), scale == SettingsHandler.macStreamScale, { CParsec.setMacStreamScale(scale) })

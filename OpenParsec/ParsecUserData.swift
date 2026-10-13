@@ -95,8 +95,16 @@ enum MacStreamScale: Int, CaseIterable {
 enum MacLowDisplayPolicy {
 	static let displayName = "Parsec Low" // ParsecLowDisplay's virtual display
 
-	static func virtual(in configs: [ParsecDisplayConfig]) -> ParsecDisplayConfig? {
-		configs.first { $0.name == displayName }
+	// By name (the host reports NSScreen.localizedName); if it reports another
+	// name, by the mirroring signature against the last list without it: one
+	// display gone, one new id.
+	// ponytail: unplugging one monitor and plugging another mid-session looks
+	// the same; then the Off hotkey is resent (rate-limited, harmless).
+	static func virtual(in configs: [ParsecDisplayConfig], native: [ParsecDisplayConfig] = []) -> ParsecDisplayConfig? {
+		if let named = configs.first(where: { $0.name == displayName }) { return named }
+		let added = configs.filter { c in !native.contains { $0.id == c.id } }
+		guard !native.isEmpty, added.count == 1, mirroredSource(native: native, current: configs) != nil else { return nil }
+		return added[0]
 	}
 
 	// The display the virtual one mirrors drops out of the host's list: the one
@@ -113,8 +121,8 @@ enum MacLowDisplayPolicy {
 	}
 
 	// What to do with a fresh host display list.
-	static func reconcile(configs: [ParsecDisplayConfig], output: String, scale: MacStreamScale, source: String?) -> Action {
-		let low = virtual(in: configs)
+	static func reconcile(configs: [ParsecDisplayConfig], native: [ParsecDisplayConfig] = [], output: String, scale: MacStreamScale, source: String?) -> Action {
+		let low = virtual(in: configs, native: native)
 		if scale != .native {
 			guard let low else { return .sendScale }
 			return output == low.id ? .none : .stream(low.id)

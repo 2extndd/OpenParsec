@@ -2748,6 +2748,13 @@ final class MacLowDisplayTests: XCTestCase {
         typealias P = MacLowDisplayPolicy
         XCTAssertEqual(P.virtual(in: [d1, low])?.id, "9")
         XCTAssertNil(P.virtual(in: [d1, d3]))
+        // Host reports another name: found by the mirror swap (one gone, one new).
+        let unnamed = ParsecDisplayConfig(name: "Display", adapterName: "", id: "9")
+        XCTAssertEqual(P.virtual(in: [unnamed, d3], native: [d1, d3])?.id, "9")
+        XCTAssertNil(P.virtual(in: [unnamed, d3], native: []), "no baseline")
+        XCTAssertNil(P.virtual(in: [d1, d3, unnamed], native: [d1, d3]), "plugged in, nothing gone")
+        XCTAssertNil(P.virtual(in: [d3], native: [d1, d3]), "unplugged, nothing new")
+        XCTAssertEqual(P.reconcile(configs: [unnamed, d3], native: [d1, d3], output: "1", scale: .half, source: nil), .stream("9"))
 
         XCTAssertEqual(P.mirroredSource(native: [d1, d3], current: [low, d3]), "1")
         XCTAssertEqual(P.mirroredSource(native: [d1, d3], current: [d1, low]), "3")

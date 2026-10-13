@@ -1063,7 +1063,7 @@ class CParsec
 	
 	// Mac stream size (MacLowDisplayPolicy). The last host display list without
 	// the virtual display, the physical display it mirrors, the last hotkey.
-	private static var macNativeDisplays: [ParsecDisplayConfig] = []
+	static var macNativeDisplays: [ParsecDisplayConfig] = []
 	static var macLowSource: String?
 	static var lastMacLowKeyAt = Date.distantPast
 
@@ -1092,13 +1092,13 @@ class CParsec
 	// list (main thread).
 	static func reconcileMacLowDisplay(_ configs: [ParsecDisplayConfig]) {
 		guard hostOS == .macos else { return }
-		if MacLowDisplayPolicy.virtual(in: configs) == nil {
+		if MacLowDisplayPolicy.virtual(in: configs, native: macNativeDisplays) == nil {
 			macNativeDisplays = configs
 		} else if let source = MacLowDisplayPolicy.mirroredSource(native: macNativeDisplays, current: configs) {
 			macLowSource = source
 		}
 		let scale = SettingsHandler.macStreamScale
-		switch MacLowDisplayPolicy.reconcile(configs: configs, output: DataManager.model.output, scale: scale, source: macLowSource) {
+		switch MacLowDisplayPolicy.reconcile(configs: configs, native: macNativeDisplays, output: DataManager.model.output, scale: scale, source: macLowSource) {
 		case .none:
 			break
 		case .stream(let id):

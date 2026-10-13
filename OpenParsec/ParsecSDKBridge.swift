@@ -254,11 +254,12 @@ class ParsecSDKBridge: ParsecService
 				DataManager.model.hostOutput = "none"
 				DataManager.model.displayConfigs = []
 				CParsec.macLowSource = nil
+				CParsec.macNativeDisplays = []
 			}
 		}
 		// The helper's virtual display lives for one session: don't push its id.
 		DispatchQueue.main.async {
-			if let low = MacLowDisplayPolicy.virtual(in: DataManager.model.displayConfigs), DataManager.model.output == low.id {
+			if let low = MacLowDisplayPolicy.virtual(in: DataManager.model.displayConfigs, native: CParsec.macNativeDisplays), DataManager.model.output == low.id {
 				DataManager.model.output = CParsec.macLowSource ?? "none"
 			}
 		}
