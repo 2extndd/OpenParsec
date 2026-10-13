@@ -389,6 +389,9 @@ struct SettingsView:View
 		.onChange(of: bitrate) { _ in
 			SettingsHandler.notifyChanged(.bitrate)
 		}
+		.onChange(of: macStreamScale) { _ in
+			SettingsHandler.notifyChanged(.macStreamScale)
+		}
 		.onAppear {
 			// Pull a value saved before the safety cap down to the ceiling so the
 			// picker shows a selectable option and the host is never asked for more.

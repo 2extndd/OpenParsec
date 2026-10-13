@@ -566,7 +566,7 @@ class CParsec
 		}
 		// Mac stream size lasts one session (the helper drops its display on
 		// disconnect); a reconnect of the same session keeps it.
-		if intent == .initial { endMacStreamScale() }
+		if intent == .initial { endMacStreamScale(sendOff: false) }
 		if mouseInputSnapshot.pressedCount > 0 {
 			releaseAllMouseButtons(reason: .reconnect)
 		}
@@ -655,7 +655,7 @@ class CParsec
 		// disconnect transition. A duplicate notification then observes the
 		// terminal phase and cannot tear the adapter down a second time.
 		lastConnectedPeerID = nil
-		if reason == .user { endMacStreamScale() } // Off reaches the helper before the link goes
+		if reason == .user { endMacStreamScale(sendOff: true) }
 		ParsecBackgroundManager.shared.connectionDidEnd(
 			generation: observedGeneration,
 			reason: reason
@@ -1092,9 +1092,14 @@ class CParsec
 		SettingsHandler.macStreamScale = scale
 	}
 
-	static func endMacStreamScale() {
+	// sendOff: still connected, so Off (no display re-list) goes to the helper.
+	static func endMacStreamScale(sendOff: Bool) {
 		guard SettingsHandler.macStreamScale != .native else { return }
 		Diagnostics.note("mac-low event=end")
+		if sendOff, hostOS == .macos {
+			lastMacLowKeyAt = Date()
+			_ = sendKeyboardChord(MacStreamScale.modifiers + [MacStreamScale.native.key], route: .explicitMacro)
+		}
 		SettingsHandler.macStreamScale = .native
 	}
 

@@ -242,22 +242,28 @@ final class SettingsRuntimeTests: XCTestCase {
         resetMacLow(output: "1")
         SettingsHandler.macStreamScale = .native
         service.reset()
-        // Settings / poor-network preset: the live handler sends it.
+        // Settings / poor-network preset: SettingsView notifies, the live handler sends it.
         SettingsHandler.macStreamScale = .half
+        SettingsHandler.notifyChanged(.macStreamScale)
         XCTAssertEqual(service.keyboard.filter { $0.hasSuffix(":true") }, ["224:true", "226:true", "227:true", "13:true"])
         // The session menu sends it once, not again through the handler.
         service.reset()
         CParsec.setMacStreamScale(.twoThirds)
+        SettingsHandler.notifyChanged(.macStreamScale)
         XCTAssertEqual(service.keyboard.filter { $0.hasSuffix(":true") }, ["224:true", "226:true", "227:true", "14:true"])
         // Disconnect: back to native, Off (H) to the helper.
         service.reset()
         CParsec.lastMacLowKeyAt = .distantPast
-        CParsec.endMacStreamScale()
+        CParsec.endMacStreamScale(sendOff: true)
         XCTAssertEqual(SettingsHandler.macStreamScale, .native)
         XCTAssertEqual(service.keyboard.filter { $0.hasSuffix(":true") }, ["224:true", "226:true", "227:true", "11:true"])
         service.reset()
-        CParsec.endMacStreamScale()
+        CParsec.endMacStreamScale(sendOff: true)
         XCTAssertEqual(service.keyboard, [], "already native: nothing sent")
+        SettingsHandler.macStreamScale = .half
+        CParsec.endMacStreamScale(sendOff: false) // new connect: silent reset
+        XCTAssertEqual(SettingsHandler.macStreamScale, .native)
+        XCTAssertEqual(service.keyboard, [])
         _ = controller
     }
 
