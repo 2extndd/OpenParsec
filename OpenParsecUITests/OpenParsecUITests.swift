@@ -417,7 +417,7 @@ final class OpenParsecUITests: XCTestCase {
         // The contract coverage count is wired into the running app.
         assertElement(
             "openparsec.settings.coverage",
-            hasLabel: "30",
+            hasLabel: "31",
             in: app,
             timeout: 10
         )
