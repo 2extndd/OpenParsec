@@ -237,6 +237,30 @@ final class SettingsRuntimeTests: XCTestCase {
         XCTAssertEqual(service.keyboard.filter { $0.hasSuffix(":true") }, ["224:true", "226:true", "227:true", "11:true"])
     }
 
+    func testMacStreamScaleFromSettingsIsLiveAndEndsWithTheSession() {
+        let controller = loadedController()
+        resetMacLow(output: "1")
+        SettingsHandler.macStreamScale = .native
+        service.reset()
+        // Settings / poor-network preset: the live handler sends it.
+        SettingsHandler.macStreamScale = .half
+        XCTAssertEqual(service.keyboard.filter { $0.hasSuffix(":true") }, ["224:true", "226:true", "227:true", "13:true"])
+        // The session menu sends it once, not again through the handler.
+        service.reset()
+        CParsec.setMacStreamScale(.twoThirds)
+        XCTAssertEqual(service.keyboard.filter { $0.hasSuffix(":true") }, ["224:true", "226:true", "227:true", "14:true"])
+        // Disconnect: back to native, Off (H) to the helper.
+        service.reset()
+        CParsec.lastMacLowKeyAt = .distantPast
+        CParsec.endMacStreamScale()
+        XCTAssertEqual(SettingsHandler.macStreamScale, .native)
+        XCTAssertEqual(service.keyboard.filter { $0.hasSuffix(":true") }, ["224:true", "226:true", "227:true", "11:true"])
+        service.reset()
+        CParsec.endMacStreamScale()
+        XCTAssertEqual(service.keyboard, [], "already native: nothing sent")
+        _ = controller
+    }
+
     func testMacLowDisplayFullCycleOnAMacHost() {
         resetMacLow(output: "1")
         SettingsHandler.macStreamScale = .half

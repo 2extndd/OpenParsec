@@ -564,6 +564,9 @@ class CParsec
 				? .connecting
 				: current.transportStatus
 		}
+		// Mac stream size lasts one session (the helper drops its display on
+		// disconnect); a reconnect of the same session keeps it.
+		if intent == .initial { endMacStreamScale() }
 		if mouseInputSnapshot.pressedCount > 0 {
 			releaseAllMouseButtons(reason: .reconnect)
 		}
@@ -652,6 +655,7 @@ class CParsec
 		// disconnect transition. A duplicate notification then observes the
 		// terminal phase and cannot tear the adapter down a second time.
 		lastConnectedPeerID = nil
+		if reason == .user { endMacStreamScale() } // Off reaches the helper before the link goes
 		ParsecBackgroundManager.shared.connectionDidEnd(
 			generation: observedGeneration,
 			reason: reason
@@ -1086,6 +1090,12 @@ class CParsec
 		Diagnostics.note("mac-low event=choose scale=\(scale)")
 		sendMacLowDisplayKey(scale.key) // first: the live settings handler then skips it
 		SettingsHandler.macStreamScale = scale
+	}
+
+	static func endMacStreamScale() {
+		guard SettingsHandler.macStreamScale != .native else { return }
+		Diagnostics.note("mac-low event=end")
+		SettingsHandler.macStreamScale = .native
 	}
 
 	// Steer the session onto / off the virtual display on every host display
