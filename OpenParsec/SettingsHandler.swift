@@ -226,7 +226,28 @@ struct SettingsHandler {
 		CParsec.hostOS == .macos ? .direct : windowsKeyboardMode
 	}
 
+	// The preset lasts one session: the user's own values it replaces, put back
+	// by endPoorNetworkPreset (session end, app launch). macStreamScale ends
+	// with the session by itself (CParsec.endMacStreamScale).
+	private static let poorNetworkBackupKey = "poorNetworkPresetBackup"
+	private static let poorNetworkIDs: [ParsecSettingID] = [.resolution, .decoder, .decoderCompatibility, .bitrate, .savedConstantFps]
+
+	static func endPoorNetworkPreset() {
+		let defaults = UserDefaults.standard
+		guard let saved = defaults.dictionary(forKey: poorNetworkBackupKey) else { return }
+		for id in poorNetworkIDs { defaults.set(saved[id.rawValue], forKey: id.rawValue) } // nil: was unset
+		defaults.removeObject(forKey: poorNetworkBackupKey)
+		Diagnostics.note("setting-preset id=poor-network result=ended")
+	}
+
 	static func applyPoorNetworkPreset() {
+		// Applied twice: keep the first backup (the user's values, not the preset's).
+		let defaults = UserDefaults.standard
+		if defaults.object(forKey: poorNetworkBackupKey) == nil {
+			var saved: [String: Any] = [:]
+			for id in poorNetworkIDs { saved[id.rawValue] = defaults.object(forKey: id.rawValue) }
+			defaults.set(saved, forKey: poorNetworkBackupKey)
+		}
 		// Manual only. Cuts what crosses the link: resolution, bitrate, codec.
 		// (Local display refresh is unrelated to the network, so untouched.)
 		resolution = .r1280x720_16_9     // ~4x fewer pixels than the iPad's native size

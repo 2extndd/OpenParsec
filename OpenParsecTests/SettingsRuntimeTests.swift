@@ -212,6 +212,26 @@ final class SettingsRuntimeTests: XCTestCase {
         _ = controller
     }
 
+    func testPoorNetworkPresetEndsWithTheSession() {
+        UserDefaults.standard.removeObject(forKey: "poorNetworkPresetBackup")
+        set(.bitrate, 25)
+        set(.resolution, ParsecResolution.r1920x1080_16_9.rawValue)
+        set(.savedConstantFps, true)
+        UserDefaults.standard.removeObject(forKey: ParsecSettingID.decoderCompatibility.rawValue)
+        SettingsHandler.applyPoorNetworkPreset()
+        SettingsHandler.applyPoorNetworkPreset() // twice: the user's values still win
+        XCTAssertEqual(SettingsHandler.bitrate, 5)
+
+        SettingsHandler.endPoorNetworkPreset()
+        XCTAssertEqual(SettingsHandler.bitrate, 25)
+        XCTAssertEqual(SettingsHandler.resolution, .r1920x1080_16_9)
+        XCTAssertTrue(SettingsHandler.savedConstantFps)
+        XCTAssertNil(UserDefaults.standard.object(forKey: ParsecSettingID.decoderCompatibility.rawValue), "unset stays unset")
+        SettingsHandler.bitrate = 10
+        SettingsHandler.endPoorNetworkPreset() // nothing to restore: no-op
+        XCTAssertEqual(SettingsHandler.bitrate, 10)
+    }
+
     // MARK: - Mac stream size (mac-helper/ParsecLowDisplay)
 
     private let mac1 = ParsecDisplayConfig(name: "Built-in Retina Display", adapterName: "", id: "1")

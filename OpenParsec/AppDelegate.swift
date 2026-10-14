@@ -260,6 +260,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate
 		// failures during the rest of launch too.
 		CrashReporter.install()
 		Diagnostics.trimIfNeeded()
+		SettingsHandler.endPoorNetworkPreset() // killed mid-session: the user's own settings again
 		// Marks every process start, so a silent end (force-quit, jetsam) shows
 		// as a gap followed by this line instead of looking like a hang.
 		let info = Bundle.main.infoDictionary

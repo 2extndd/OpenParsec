@@ -656,6 +656,8 @@ class CParsec
 		// terminal phase and cannot tear the adapter down a second time.
 		lastConnectedPeerID = nil
 		if reason == .user { endMacStreamScale(sendOff: true) }
+		// A reconfigure reconnect is the same session (the preset's resolution needs one).
+		if reason != .reconfigure { SettingsHandler.endPoorNetworkPreset() }
 		ParsecBackgroundManager.shared.connectionDidEnd(
 			generation: observedGeneration,
 			reason: reason
